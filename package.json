@@ -1,6 +1,7 @@
 {
   "name": "carpe-diem-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "mcpName": "io.github.Irdanwen/carpe-diem-mcp",
   "description": "Model Context Protocol server for Carpe Diem — Venice-grade AI inference (chat, image, video, audio, music, embeddings, web) at marketplace prices, with best-price routing, spend guards and optional x402 pay-per-call on Base.",
   "license": "MIT",
   "repository": {
@@ -21,7 +22,8 @@
     "dist",
     "README.md",
     "LICENSE",
-    "mcp.json"
+    "mcp.json",
+    "server.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",

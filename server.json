@@ -1,0 +1,56 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Irdanwen/carpe-diem-mcp",
+  "description": "Venice AI models via Carpe Diem: TEE or best-price routing, spend limits, x402 pay-per-call.",
+  "repository": {
+    "url": "https://github.com/Irdanwen/carpe-diem-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://carpe-diem.xyz/docs/integrations",
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "carpe-diem-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CARPE_API_KEY",
+          "description": "Carpe Diem API key (cdm_…), from carpe-diem.xyz → API → Keys",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "CARPE_MAX_SPEND_USD",
+          "description": "Session spend cap in USD (default 5, 0 = off)",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "CARPE_MAX_PER_CALL_USD",
+          "description": "Per-call spend cap in USD (default 0.50)",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "CARPE_X402_PRIVATE_KEY",
+          "description": "Agent wallet key for x402 pay-per-call, instead of an API key",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "CARPE_X402_BUDGET_USD",
+          "description": "Required with CARPE_X402_PRIVATE_KEY: total USDC the escrow may ever pull",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
