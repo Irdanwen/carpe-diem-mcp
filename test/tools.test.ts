@@ -242,6 +242,14 @@ describe('account, quote, errors, retries', () => {
     await h.close()
   })
 
+  test("a provider key's upstream spend limit (402 VENICE_ERROR) is retried once", async () => {
+    const h = await withKey()
+    const r = await h.call('carpe_web_search', { query: 'provider-limit' })
+    assert.equal(r.isError, false, r.text)
+    assert.equal(mock.counters['provider-limit'], 2)
+    await h.close()
+  })
+
   test('the session budget stops a looping agent', async () => {
     const h = await withKey({ CARPE_MAX_SPEND_USD: '0.003', CARPE_MAX_PER_CALL_USD: '0.002' })
     const first = await h.call('carpe_chat', { prompt: 'x', model: 'llama-3.3-70b', max_tokens: 10 })

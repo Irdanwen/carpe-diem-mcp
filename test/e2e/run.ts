@@ -90,7 +90,7 @@ if (tiers.has('async')) {
   const music = await step('music queue', 'carpe_music_generate', { prompt: 'calm lo-fi piano loop', model: 'ace-step-15', duration_seconds: 60 })
   if (music.structured?.job_id) await step('music status', 'carpe_music_status', { job_id: music.structured.job_id, wait_seconds: 300 }, (r) => (r.structured.status === 'completed' ? undefined : `status ${r.structured.status}`))
   const model = process.env.CARPE_E2E_VIDEO_MODEL ?? 'grok-imagine-1-5-lite-text-to-video'
-  const video = await step(`video queue (${model})`, 'carpe_video_generate', { model, prompt: 'a paper boat on a calm lake', duration: process.env.CARPE_E2E_VIDEO_DURATION ?? '1s' })
+  const video = await step(`video queue (${model})`, 'carpe_video_generate', { model, prompt: 'a paper boat on a calm lake', duration: process.env.CARPE_E2E_VIDEO_DURATION ?? '1s', aspect_ratio: '16:9' })
   if (video.structured?.job_id) await step('video status', 'carpe_video_status', { job_id: video.structured.job_id, wait_seconds: 600 }, (r) => (r.structured.status === 'completed' ? undefined : `status ${r.structured.status}`))
 }
 

@@ -252,6 +252,7 @@ export async function startMockCarpe(): Promise<MockCarpe> {
 
       case 'POST /v1/augment/search':
         if (!needKey()) return
+        if (body.query === 'provider-limit' && bump('provider-limit') === 1) return send(res, 402, { error: 'API key USD spend limit exceeded.', code: 'VENICE_ERROR' })
         return send(res, 200, { query: body.query, results: [{ title: 'A', url: 'https://a.example' }] }, cost(5300))
 
       case 'POST /v1/image/generate':

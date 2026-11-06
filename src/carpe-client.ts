@@ -229,6 +229,8 @@ export class CarpeClient {
     if (err instanceof CarpeError) {
       if (err.code === 'IDEMPOTENCY_KEY_SPENT' || err.code === 'IDEMPOTENCY_KEY_REUSED') return false
       if (err.notExecuted && RETRYABLE_CODES.has(err.code)) return true
+      // A provider's own Venice key hit its spend limit: refused before serving, another key may take it.
+      if (err.status === 402 && err.code === 'VENICE_ERROR') return true
       // With an Idempotency-Key the operator replays the first answer instead of re-running it.
       if (opts.idempotencyKey && (err.status === 502 || err.status === 503 || err.code === 'IDEMPOTENCY_IN_FLIGHT')) return true
       return false

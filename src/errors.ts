@@ -208,6 +208,9 @@ function hintFor(code: string, status: number, details: unknown): string | undef
       return 'Browser-bound keys cannot use /router or x402. Use route "carpe" or a regular API key.'
     case 'PARTNER_KEY_NOT_ALLOWED':
       return 'Partner keys cannot read wallet activity. Use a regular API key created on carpe-diem.xyz.'
+    case 'VENICE_ERROR':
+      if (status === 402) return 'A Carpe provider key hit its own upstream spend limit — not your balance. Retry in a few seconds; another provider usually takes it.'
+      return 'Upstream (Venice) error. Retrying later usually works; check details for refused parameters.'
     default:
       if (status >= 500) return 'Transient operator or upstream failure. Retrying later usually works.'
       return undefined
