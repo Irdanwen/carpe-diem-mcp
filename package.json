@@ -3,11 +3,26 @@
   "version": "0.1.0",
   "description": "Model Context Protocol server for Carpe Diem — Venice-grade AI inference (chat, image, video, audio, music, embeddings, web) at marketplace prices, with best-price routing, spend guards and optional x402 pay-per-call on Base.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Irdanwen/carpe-diem-mcp.git"
+  },
+  "homepage": "https://github.com/Irdanwen/carpe-diem-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Irdanwen/carpe-diem-mcp/issues"
+  },
   "type": "module",
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
-  "bin": { "carpe-mcp": "dist/cli.js" },
-  "files": ["dist", "README.md", "LICENSE", "mcp.json"],
+  "bin": {
+    "carpe-mcp": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "mcp.json"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
     "start": "node dist/cli.js",
@@ -18,8 +33,22 @@
     "test:e2e": "npm run build && tsx test/e2e/run.ts",
     "prepublishOnly": "npm run build"
   },
-  "engines": { "node": ">=20" },
-  "keywords": ["mcp", "model-context-protocol", "carpe-diem", "venice", "x402", "base", "usdc", "llm", "ai", "router", "claude"],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "carpe-diem",
+    "venice",
+    "x402",
+    "base",
+    "usdc",
+    "llm",
+    "ai",
+    "router",
+    "claude"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "express": "^4.22.3",
