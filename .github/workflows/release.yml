@@ -1,0 +1,31 @@
+name: Release
+
+# Publishes to npm when a tag vX.Y.Z is pushed, through npm Trusted Publishing
+# (OIDC): no npm token or OTP is stored anywhere. One-time setup on npmjs.com:
+# package carpe-diem-mcp → Settings → Trusted publishing → GitHub Actions,
+# repository Irdanwen/carpe-diem-mcp, workflow file release.yml.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - name: Tag matches package.json version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test "v$(node -p "require('./package.json').version")" = "$TAG"
+      - run: npm publish --access public --provenance
