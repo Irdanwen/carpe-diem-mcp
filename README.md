@@ -11,7 +11,7 @@ Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP hos
 
 ## Quick start
 
-1. Create an API key on [carpe-diem.xyz](https://carpe-diem.xyz) → **Build → API keys** (`cdm_…`) and add credits.
+1. Create an API key on [carpe-diem.xyz](https://carpe-diem.xyz/build?tab=keys) → **API → Keys** (`cdm_…`) and add credits in **API → Balance**.
 2. Add the server to your MCP host.
 
 **Claude Code**
@@ -33,6 +33,36 @@ claude mcp add carpe -e CARPE_API_KEY=cdm_your_key -- npx -y carpe-diem-mcp
   }
 }
 ```
+
+**Codex** (`~/.codex/config.toml`, or `codex mcp add carpe --env CARPE_API_KEY=cdm_your_key -- npx -y carpe-diem-mcp`)
+
+```toml
+[mcp_servers.carpe]
+command = "npx"
+args = ["-y", "carpe-diem-mcp"]
+env_vars = ["CARPE_API_KEY"]
+```
+
+**VS Code** (`.vscode/mcp.json`) — the key is asked once and stored securely
+
+```json
+{
+  "inputs": [{ "type": "promptString", "id": "carpe-key", "description": "Carpe Diem API key", "password": true }],
+  "servers": {
+    "carpe": { "type": "stdio", "command": "npx", "args": ["-y", "carpe-diem-mcp"], "env": { "CARPE_API_KEY": "${input:carpe-key}" } }
+  }
+}
+```
+
+**OpenCode** (`opencode.json`)
+
+```json
+{ "mcp": { "carpe": { "type": "local", "command": ["npx", "-y", "carpe-diem-mcp"], "environment": { "CARPE_API_KEY": "{env:CARPE_API_KEY}" } } } }
+```
+
+**Gemini CLI** (`~/.gemini/settings.json`) — declare the key in `env`: Gemini CLI hides inherited variables named `*KEY*`.
+
+Zed, Cline, Goose, Continue, LM Studio and others, with use cases and costs: **[carpe-diem.xyz/docs/integrations](https://carpe-diem.xyz/docs/integrations#mcp-install)**. ChatGPT and claude.ai on the web only accept remote MCP servers with OAuth, which this local server is not.
 
 3. Restart the host and ask: *"Find the cheapest model to summarise this text, then do it."*
 
@@ -114,6 +144,11 @@ Media inputs accept an `https://` URL, a `data:` URI, or (stdio only) a local pa
 | `CARPE_HTTP_TIMEOUT_MS` | `120000` | |
 | `CARPE_MAX_MEDIA_BYTES` / `CARPE_MAX_VIDEO_BYTES` | 32 MiB / 64 MiB | Download caps |
 | `CARPE_STATE_DIR` | `~/.carpe-mcp` | x402 spend state |
+| `CARPE_MCP_HTTP` / `PORT` | `0` / `3333` | `1` starts the HTTP transport (same as `--http`), on `PORT` |
+| `CARPE_MCP_HOST` | `127.0.0.1` | HTTP bind address; anything else requires `CARPE_MCP_AUTH_TOKEN` |
+| `CARPE_MCP_AUTH_TOKEN` | — | Bearer token (≥ 16 chars) required by the HTTP transport off loopback |
+| `CARPE_MCP_ALLOWED_ORIGINS` | — | Comma-separated browser origins allowed on the HTTP transport |
+| `CARPE_MCP_ALLOW_UNAUTHENTICATED_HTTP` | `0` | `1` drops the token requirement off loopback. **Only** behind a trusted proxy that authenticates callers: whoever reaches the server spends its credentials |
 
 ## HTTP mode
 
@@ -123,7 +158,7 @@ CARPE_API_KEY=cdm_… npx carpe-diem-mcp --http --port 3333     # http://127.0.0
 
 The HTTP server spends the configured credentials on behalf of whoever reaches it, so it binds to `127.0.0.1` by default; any other `CARPE_MCP_HOST` requires `CARPE_MCP_AUTH_TOKEN` (≥ 16 chars, sent as `Authorization: Bearer`). Browser origins are refused unless listed in `CARPE_MCP_ALLOWED_ORIGINS`. Local file inputs and private-network URLs are disabled in HTTP mode.
 
-Carpe Diem refuses requests from sanctioned regions **and the United States** (HTTP 451): host the server elsewhere.
+Carpe Diem refuses requests from sanctioned regions (HTTP 451). Buying inference from the United States is allowed.
 
 ## Development
 
