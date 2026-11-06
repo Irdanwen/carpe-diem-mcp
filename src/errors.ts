@@ -168,7 +168,7 @@ function hintFor(code: string, status: number, details: unknown): string | undef
     case 'MUSIC_PARAM_REJECTED':
       return 'A parameter is outside what this model accepts; details.issues lists each refused field with its accepted values. carpe_model_details shows the model constraints.'
     case 'GEO_RESTRICTED':
-      return 'Carpe Diem refuses requests from this region (sanctioned countries and the United States). Run the MCP server from an allowed region.'
+      return 'Carpe Diem refuses requests from this region (sanctioned countries). Run the MCP server from an allowed region.'
     case 'OFAC_BLOCKED':
       return 'This wallet is blocked by the operator sanctions screening.'
     case 'EDGE_REQUIRED':
