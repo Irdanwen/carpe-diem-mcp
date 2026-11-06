@@ -9,6 +9,9 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { isIP } from 'node:net'
+import { lookup as dnsLookup, type LookupAddress, type LookupOptions } from 'node:dns'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { randomUUID } from 'node:crypto'
 import { LocalRefusal } from './errors.js'
 
@@ -64,6 +67,64 @@ function isPrivateHost(host: string): boolean {
   return false
 }
 
+type LookupCb = (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void
+
+/**
+ * GET a public URL with a byte cap. In strict mode (HTTP transport) every
+ * address the hostname resolves to is checked at connect time — inside the
+ * socket's own DNS lookup, so a rebinding cannot swap it after the check — and
+ * each redirect hop goes through the same check.
+ */
+export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redirects = 3): Promise<{ bytes: Buffer; contentType: string }> {
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return Promise.reject(new LocalRefusal('URL_REFUSED', 'Only http(s) URLs are accepted.'))
+  if (strict && isPrivateHost(url.hostname)) return Promise.reject(new LocalRefusal('URL_REFUSED', 'Private, loopback and local hosts are refused in HTTP mode.'))
+  const lookup = strict
+    ? (hostname: string, options: LookupOptions, cb: LookupCb) => {
+        dnsLookup(hostname, options, (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => {
+          if (err) return cb(err, address, family)
+          const list = Array.isArray(address) ? address.map((a) => a.address) : [address]
+          if (list.some((ip) => isPrivateHost(ip))) return cb(Object.assign(new Error('URL resolves to a private address'), { code: 'URL_REFUSED' }), address, family)
+          cb(null, address, family)
+        })
+      }
+    : undefined
+  return new Promise((resolve, reject) => {
+    const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { method: 'GET', lookup: lookup as never, timeout: 60_000, headers: { 'user-agent': 'carpe-diem-mcp' } }, (res) => {
+      const status = res.statusCode ?? 0
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume()
+        if (redirects <= 0) return reject(new LocalRefusal('URL_FETCH_FAILED', 'Too many redirects.'))
+        return resolve(fetchBounded(new URL(res.headers.location, url), maxBytes, strict, redirects - 1))
+      }
+      if (status < 200 || status >= 300) {
+        res.resume()
+        return reject(new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} answered HTTP ${status}.`))
+      }
+      const declared = Number(res.headers['content-length'])
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        res.destroy()
+        return reject(new LocalRefusal('MEDIA_TOO_LARGE', `Remote file is ${declared} bytes, above the ${maxBytes}-byte limit.`))
+      }
+      const chunks: Buffer[] = []
+      let total = 0
+      res.on('data', (c: Buffer) => {
+        total += c.length
+        if (total > maxBytes) {
+          res.destroy()
+          reject(new LocalRefusal('MEDIA_TOO_LARGE', `Remote file is above the ${maxBytes}-byte limit.`))
+        } else chunks.push(c)
+      })
+      res.on('end', () => resolve({ bytes: Buffer.concat(chunks, total), contentType: String(res.headers['content-type'] ?? '') }))
+      res.on('error', reject)
+    })
+    req.on('timeout', () => req.destroy(new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} timed out.`)))
+    req.on('error', (e: NodeJS.ErrnoException) =>
+      reject(e instanceof LocalRefusal ? e : e.code === 'URL_REFUSED' ? new LocalRefusal('URL_REFUSED', 'The URL resolves to a private or loopback address; refused in HTTP mode.') : new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} failed: ${e.message}`)),
+    )
+    req.end()
+  })
+}
+
 /** Resolve an input: data URI, http(s) URL, or (stdio only) a local path. */
 export async function loadMedia(input: string, policy: MediaPolicy, fallbackMime?: string): Promise<LoadedMedia> {
   const s = input.trim()
@@ -75,18 +136,8 @@ export async function loadMedia(input: string, policy: MediaPolicy, fallbackMime
     return { bytes, mime: data[1] ?? sniffMime(bytes) ?? fallbackMime ?? 'application/octet-stream' }
   }
   if (/^https?:\/\//i.test(s)) {
-    const url = new URL(s)
-    if (!policy.allowLocalFiles && isPrivateHost(url.hostname)) {
-      throw new LocalRefusal('URL_REFUSED', 'Private, loopback and local hostnames are refused in HTTP mode.')
-    }
-    // In HTTP mode a redirect could point at a private host: refuse redirects there.
-    const res = await fetch(url, { redirect: policy.allowLocalFiles ? 'follow' : 'error', signal: AbortSignal.timeout(60_000) })
-    if (!res.ok) throw new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} answered HTTP ${res.status}.`)
-    const declared = Number(res.headers.get('content-length'))
-    if (Number.isFinite(declared) && declared > policy.maxInputBytes) throw new LocalRefusal('MEDIA_TOO_LARGE', `Remote file is ${declared} bytes, above the ${policy.maxInputBytes}-byte limit.`)
-    const bytes = Buffer.from(await res.arrayBuffer())
-    if (bytes.length > policy.maxInputBytes) throw new LocalRefusal('MEDIA_TOO_LARGE', `Remote file is above the ${policy.maxInputBytes}-byte limit.`)
-    const ct = (res.headers.get('content-type') ?? '').split(';')[0].trim()
+    const { bytes, contentType } = await fetchBounded(new URL(s), policy.maxInputBytes, !policy.allowLocalFiles)
+    const ct = contentType.split(';')[0].trim()
     return { bytes, mime: sniffMime(bytes) ?? (ct && ct !== 'application/octet-stream' ? ct : fallbackMime ?? 'application/octet-stream') }
   }
   if (!policy.allowLocalFiles) throw new LocalRefusal('LOCAL_FILES_DISABLED', 'Pass a data: URI or an https:// URL (local paths are disabled in HTTP mode).')

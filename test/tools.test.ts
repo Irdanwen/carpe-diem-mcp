@@ -271,6 +271,34 @@ describe('account, quote, errors, retries', () => {
     await h.close()
   })
 
+  test('forged job ids never reach the operator', async () => {
+    const h = await withKey()
+    const from = mock.calls.length
+    for (const job_id of ['v1:image:x:..%2F..%2Fadmin', 'v1:image:q1:..%2Fadmin', 'v1:image:..:generate', 'v1:image:q%2F1:generate', 'router:video:a%3Fb=1:', 'v1:image:q1:complete']) {
+      const r = await h.call(job_id.includes('video') ? 'carpe_video_status' : 'carpe_image_status', { job_id, wait_seconds: 0 })
+      assert.match(r.text, /BAD_JOB_ID/, job_id)
+    }
+    assert.equal(mock.calls.length, from)
+    await h.close()
+  })
+
+  test('concurrent paid calls reserve their estimate: the session limit holds under parallelism', async () => {
+    const h = await withKey({ CARPE_MAX_SPEND_USD: '0.012', CARPE_MAX_PER_CALL_USD: '0.01' })
+    const rs = await Promise.all([1, 2, 3, 4].map(() => h.call('carpe_image_generate', { prompt: 'x', model: 'z-image-turbo', mode: 'sync' })))
+    const okCount = rs.filter((r) => !r.isError).length
+    assert.equal(okCount, 2, rs.map((r) => r.text.slice(0, 60)).join(' | '))
+    assert.ok(h.built.guard.spentUsd <= 0.012)
+    await h.close()
+  })
+
+  test('remote downloads are capped while streaming', async () => {
+    const { fetchBounded } = await import('../src/media.js')
+    await assert.rejects(fetchBounded(new URL(`${mock.base}/big`), 1024 * 1024, false), /MEDIA_TOO_LARGE|above/)
+    const ok = await fetchBounded(new URL(`${mock.base}/big`), 4 * 1024 * 1024, false)
+    assert.equal(ok.bytes.length, 40 * 64 * 1024)
+    await assert.rejects(fetchBounded(new URL(`${mock.base}/big`), 4 * 1024 * 1024, true), /private|loopback/i)
+  })
+
   test('HTTP mode refuses local files and private hosts', async () => {
     const h = await harness(mock.base, { CARPE_API_KEY: KEY }, { allowLocalFiles: false })
     const f = join(h.outDir, 'x.png')

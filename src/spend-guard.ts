@@ -12,7 +12,7 @@
  */
 import type { Config, Surface } from './config.js'
 import type { CallMeta, CarpeClient } from './carpe-client.js'
-import { LocalRefusal } from './errors.js'
+import { CarpeError, LocalRefusal } from './errors.js'
 
 export interface SpendRecord {
   tool: string
@@ -21,8 +21,17 @@ export interface SpendRecord {
   at: string
 }
 
+export interface SpendHold {
+  tool: string
+  amount: number
+  estimateUsd: number | undefined
+  open: boolean
+}
+
 export class SpendGuard {
   private spent = 0
+  /** Reserved by calls in flight, so concurrent calls cannot overshoot the session limit together. */
+  private pending = 0
   private readonly history: SpendRecord[] = []
 
   constructor(private readonly cfg: Config) {}
@@ -32,7 +41,33 @@ export class SpendGuard {
   }
 
   get remainingUsd(): number | null {
-    return this.cfg.maxSpendUsd > 0 ? Math.max(0, this.cfg.maxSpendUsd - this.spent) : null
+    return this.cfg.maxSpendUsd > 0 ? Math.max(0, this.cfg.maxSpendUsd - this.spent - this.pending) : null
+  }
+
+  /** Check the limits and reserve the estimate (or the per-call cap when unknown) until settle/fail. */
+  reserve(tool: string, estimateUsd: number | undefined): SpendHold {
+    this.check(tool, estimateUsd)
+    const amount = estimateUsd ?? (this.cfg.maxPerCallUsd > 0 ? this.cfg.maxPerCallUsd : 0)
+    this.pending += amount
+    return { tool, amount, estimateUsd, open: true }
+  }
+
+  settle(hold: SpendHold, meta: CallMeta | undefined): number | undefined {
+    this.close(hold)
+    return this.record(hold.tool, meta, hold.estimateUsd)
+  }
+
+  /** A failed call: free the reservation; if it may still have been billed (timeout, ambiguous 5xx), count the estimate. */
+  fail(hold: SpendHold, err: unknown): void {
+    this.close(hold)
+    const certainlyNotRun = err instanceof CarpeError && err.notExecuted
+    if (!certainlyNotRun && hold.estimateUsd !== undefined) this.record(`${hold.tool} (failed, possibly billed)`, undefined, hold.estimateUsd)
+  }
+
+  private close(hold: SpendHold): void {
+    if (!hold.open) return
+    hold.open = false
+    this.pending = Math.max(0, this.pending - hold.amount)
   }
 
   check(tool: string, estimateUsd: number | undefined): void {

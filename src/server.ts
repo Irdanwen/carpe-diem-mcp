@@ -19,6 +19,8 @@ export interface BuildOptions {
   x402Deps?: X402Deps
   /** Local file inputs and private-host URLs: true for stdio, false for HTTP. */
   allowLocalFiles?: boolean
+  /** Share one payment session and spend guard across several MCP sessions (HTTP mode). */
+  core?: ServerCore
 }
 
 export interface BuiltServer {
@@ -38,12 +40,23 @@ export function instructions(cfg: Config): string {
   ].join(' ')
 }
 
-export function buildServer(opts: BuildOptions = {}): BuiltServer {
+/** The stateful part — payment session, spend guard, estimator — shared by every MCP session of a process. */
+export interface ServerCore {
+  cfg: Config
+  client: CarpeClient
+  guard: SpendGuard
+  estimator: Estimator
+}
+
+export function buildCore(opts: Omit<BuildOptions, 'allowLocalFiles' | 'core'> = {}): ServerCore {
   const cfg = opts.config ?? loadConfig()
   const x402 = paymentMode(cfg) === 'x402' ? new X402Session(cfg, opts.x402Deps) : undefined
   const client = new CarpeClient(cfg, x402, opts.fetchImpl)
-  const guard = new SpendGuard(cfg)
-  const estimator = new Estimator(client)
+  return { cfg, client, guard: new SpendGuard(cfg), estimator: new Estimator(client) }
+}
+
+export function buildServer(opts: BuildOptions = {}): BuiltServer {
+  const { cfg, client, guard, estimator } = opts.core ?? buildCore(opts)
   const tools = buildTools({
     client,
     cfg,

@@ -15,7 +15,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { isIP } from 'node:net'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { buildServer } from '../server.js'
+import { buildCore, buildServer } from '../server.js'
 
 const MAX_SESSIONS = 100
 const SESSION_TTL_MS = 30 * 60 * 1000
@@ -57,6 +57,9 @@ export async function runHttp(opts: { port: number; host?: string }): Promise<vo
   validateHttpConfig(host, token)
   const allowedOrigins = new Set((process.env.CARPE_MCP_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean))
   const sessions = new Map<string, Session>()
+  // One payment session and ONE spend guard for the whole process: a client cannot
+  // reset the session budget by opening a new MCP session.
+  const core = buildCore()
 
   const app = express()
   app.disable('x-powered-by')
@@ -112,7 +115,7 @@ export async function runHttp(opts: { port: number; host?: string }): Promise<vo
       transport.onclose = () => {
         if (transport.sessionId) sessions.delete(transport.sessionId)
       }
-      const { server } = buildServer({ allowLocalFiles: false })
+      const { server } = buildServer({ allowLocalFiles: false, core })
       await server.connect(transport)
       session = { transport, lastSeen: Date.now() }
     }

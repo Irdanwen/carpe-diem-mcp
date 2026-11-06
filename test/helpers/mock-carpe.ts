@@ -176,6 +176,10 @@ export async function startMockCarpe(): Promise<MockCarpe> {
       case 'GET /buyer/usage':
         if (!needKey()) return
         return send(res, 200, { events: [{ id: 1, model: 'llama-3.3-70b', cost_usdc: 0.001 }], total: 1, query: Object.fromEntries(url.searchParams) })
+      case 'GET /big':
+        res.writeHead(200, { 'content-type': 'application/octet-stream' })
+        for (let i = 0; i < 40; i++) res.write(Buffer.alloc(64 * 1024))
+        return res.end()
       case 'GET /redirect':
         res.writeHead(302, { location: 'http://evil.example/' })
         return res.end()

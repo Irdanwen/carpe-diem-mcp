@@ -225,7 +225,8 @@ export function imageTools(ctx: ToolContext): ToolDef[] {
       inputSchema: { job_id: z.string().min(1), wait_seconds: WAIT },
       handler: safe(async (a, extra) => {
         const job = decodeJob(a.job_id, 'image')
-        const kind = (job.model ?? 'generate') as ImageKind
+        const kind = job.model ?? 'generate'
+        if (kind !== 'generate' && kind !== 'edit' && kind !== 'multi-edit') throw new LocalRefusal('BAD_JOB_ID', 'Not an image job id returned by this server.')
         return queued('carpe_image_status', job.surface, kind, job.queueId, { kind }, a.wait_seconds ?? 60, extra)
       }),
     },

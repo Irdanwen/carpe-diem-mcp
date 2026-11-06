@@ -6,7 +6,7 @@ import type { Estimator, SpendGuard } from '../spend-guard.js'
 import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { saveMedia, type LoadedMedia, type MediaPolicy } from '../media.js'
-import { describeError } from '../errors.js'
+import { describeError, LocalRefusal } from '../errors.js'
 
 export interface ToolContext {
   client: CarpeClient
@@ -69,12 +69,17 @@ export function costInfo(meta: CallMeta | undefined, estimateUsd: number | undef
   }
 }
 
-/** Run a paid request through the spend guard. */
+/** Run a paid request through the spend guard (reserve → call → settle, or release on failure). */
 export async function paid(ctx: ToolContext, tool: string, estimateUsd: number | undefined, opts: RequestOptions): Promise<CarpeResponse> {
-  ctx.guard.check(tool, estimateUsd)
-  const res = await ctx.client.request({ ...opts, auth: 'paid' })
-  ctx.guard.record(tool, res.meta, estimateUsd)
-  return res
+  const hold = ctx.guard.reserve(tool, estimateUsd)
+  try {
+    const res = await ctx.client.request({ ...opts, auth: 'paid' })
+    ctx.guard.settle(hold, res.meta)
+    return res
+  } catch (err) {
+    ctx.guard.fail(hold, err)
+    throw err
+  }
 }
 
 export function ok(text: string, structured: Record<string, unknown>, extra: CallToolResult['content'] = []): CallToolResult {
@@ -111,12 +116,25 @@ export type JobSurface = 'v1' | 'router' | 'x402'
 export function encodeJob(surface: JobSurface, kind: string, queueId: string, model?: string): string {
   return [surface, kind, queueId, model ?? ''].map((p) => encodeURIComponent(p)).join(':')
 }
+/** Job ids are model-supplied: every field is validated before it reaches a path or a body. */
+const SAFE_FIELD = /^[A-Za-z0-9._@+=-]{1,200}$/
 export function decodeJob(handle: string, kind: string): { surface: JobSurface; queueId: string; model?: string } {
-  const parts = handle.split(':').map((p) => decodeURIComponent(p))
-  if (parts.length === 4 && (parts[0] === 'v1' || parts[0] === 'router' || parts[0] === 'x402') && parts[1] === kind && parts[2]) {
-    return { surface: parts[0], queueId: parts[2], model: parts[3] || undefined }
+  let parts: string[]
+  try {
+    parts = handle.split(':').map((p) => decodeURIComponent(p))
+  } catch {
+    parts = []
   }
-  throw new Error(`"${handle}" is not a ${kind} job id returned by carpe_${kind}_generate.`)
+  const [surface, k, queueId, model] = parts
+  const valid =
+    parts.length === 4 &&
+    (surface === 'v1' || surface === 'router' || surface === 'x402') &&
+    k === kind &&
+    SAFE_FIELD.test(queueId ?? '') &&
+    !queueId.includes('..') &&
+    (model === '' || (SAFE_FIELD.test(model) && !model.includes('..')) || /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(model))
+  if (!valid) throw new LocalRefusal('BAD_JOB_ID', `"${handle.slice(0, 120)}" is not a ${kind} job id returned by this server.`)
+  return { surface: surface as JobSurface, queueId, model: model || undefined }
 }
 
 /** Turn produced media into MCP content: inline when small enough, else (or also) a file. */

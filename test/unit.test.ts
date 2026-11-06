@@ -71,8 +71,11 @@ test('route info: /v1 is TEE; router reports the market and warns outside a TEE'
 })
 
 test('job ids carry their surface and refuse foreign handles', () => {
-  const h = encodeJob('router', 'video', 'q:1/2', 'kling')
-  assert.deepEqual(decodeJob(h, 'video'), { surface: 'router', queueId: 'q:1/2', model: 'kling' })
+  const h = encodeJob('router', 'video', '3f2a9c1e-7b1d-4c3e-9a55-0d1e2f3a4b5c', 'kling-2.5-turbo-pro-text-to-video')
+  assert.deepEqual(decodeJob(h, 'video'), { surface: 'router', queueId: '3f2a9c1e-7b1d-4c3e-9a55-0d1e2f3a4b5c', model: 'kling-2.5-turbo-pro-text-to-video' })
+  assert.equal(decodeJob(encodeJob('v1', 'music', 'q1', 'openai/whisper'), 'music').model, 'openai/whisper')
+  assert.throws(() => decodeJob(encodeJob('v1', 'video', 'q/1', 'm'), 'video'), /not a video job id/)
+  assert.throws(() => decodeJob(encodeJob('v1', 'video', '..', 'm'), 'video'))
   assert.throws(() => decodeJob(h, 'music'))
   assert.throws(() => decodeJob('q-123', 'video'))
 })

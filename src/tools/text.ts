@@ -80,10 +80,11 @@ export function textTools(ctx: ToolContext): ToolDef[] {
         }
 
         const estimate = await ctx.estimator.tokenCost(model, estimateInputTokens(messages), a.max_tokens ?? 1024, surface, a.privacy)
-        ctx.guard.check('carpe_chat', estimate)
+        const hold = ctx.guard.reserve('carpe_chat', estimate)
 
-        let completion: Record<string, any>
-        let meta: CallMeta
+        let completion: Record<string, any> = {}
+        let meta: CallMeta = { status: 0 }
+        try {
         if (ctx.client.mode === 'api_key') {
           const path = surface === 'router' ? '/router/chat/completions' : '/v1/chat/completions'
           const r = await ctx.client.openStream({
@@ -126,7 +127,11 @@ export function textTools(ctx: ToolContext): ToolDef[] {
           meta = res.meta
           completion = res.json<Record<string, any>>()
         }
-        ctx.guard.record('carpe_chat', meta, estimate)
+        } catch (err) {
+          ctx.guard.fail(hold, err)
+          throw err
+        }
+        ctx.guard.settle(hold, meta)
 
         const choice = completion?.choices?.[0] ?? {}
         const msg = choice.message ?? {}
