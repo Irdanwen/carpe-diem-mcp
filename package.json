@@ -1,0 +1,35 @@
+{
+  "name": "carpe-diem-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for Carpe Diem — Venice-grade AI inference (chat, image, video, audio, music, embeddings, web) at marketplace prices, with best-price routing, spend guards and optional x402 pay-per-call on Base.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "bin": { "carpe-mcp": "dist/cli.js" },
+  "files": ["dist", "README.md", "LICENSE", "mcp.json"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "start": "node dist/cli.js",
+    "start:http": "node dist/cli.js --http",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && tsx --test test/*.test.ts",
+    "test:contract": "npm run build && tsx --test test/contract/*.test.ts",
+    "test:e2e": "npm run build && tsx test/e2e/run.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": { "node": ">=20" },
+  "keywords": ["mcp", "model-context-protocol", "carpe-diem", "venice", "x402", "base", "usdc", "llm", "ai", "router", "claude"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "express": "^4.22.3",
+    "viem": "^2.57.16",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.2"
+  }
+}

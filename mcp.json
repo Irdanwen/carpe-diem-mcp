@@ -1,0 +1,27 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp.json",
+  "name": "carpe-diem",
+  "displayName": "Carpe Diem",
+  "description": "Venice AI models (text, image, video, speech, music, embeddings, web) at Carpe Diem marketplace prices: TEE-only /v1 or best-price /router, spend guards, optional x402 pay-per-call on Base.",
+  "homepage": "https://carpe-diem.xyz",
+  "license": "MIT",
+  "version": "0.1.0",
+  "keywords": ["venice", "carpe-diem", "x402", "base", "usdc", "router", "tee", "image-generation", "video-generation", "tts"],
+  "transports": ["stdio"],
+  "command": {
+    "stdio": {
+      "command": "npx",
+      "args": ["-y", "carpe-diem-mcp@0.1.0"],
+      "env": {
+        "CARPE_API_KEY": "${CARPE_API_KEY}",
+        "CARPE_MAX_SPEND_USD": "${CARPE_MAX_SPEND_USD}"
+      }
+    }
+  },
+  "config": {
+    "CARPE_API_KEY": { "description": "Carpe Diem API key (cdm_…). Without it, only free tools work unless x402 is configured.", "required": false },
+    "CARPE_MAX_SPEND_USD": { "description": "Session spend cap in USD (default 5, 0 = off).", "required": false },
+    "CARPE_X402_PRIVATE_KEY": { "description": "Agent wallet key for x402 pay-per-call (used only without CARPE_API_KEY).", "required": false },
+    "CARPE_X402_BUDGET_USD": { "description": "Required with CARPE_X402_PRIVATE_KEY: total USDC the escrow may ever pull.", "required": false }
+  }
+}

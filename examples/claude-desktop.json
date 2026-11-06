@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "carpe": {
+      "command": "npx",
+      "args": ["-y", "carpe-diem-mcp"],
+      "env": {
+        "CARPE_API_KEY": "cdm_your_key",
+        "CARPE_MAX_SPEND_USD": "5",
+        "CARPE_MAX_PER_CALL_USD": "0.50",
+        "CARPE_OUTPUT_DIR": "/Users/you/Pictures/carpe"
+      }
+    }
+  }
+}

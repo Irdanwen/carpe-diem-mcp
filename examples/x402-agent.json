@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "carpe-x402": {
+      "command": "npx",
+      "args": ["-y", "carpe-diem-mcp"],
+      "env": {
+        "CARPE_X402_PRIVATE_KEY": "0x<dedicated agent wallet key, holding only what it may spend>",
+        "CARPE_X402_BUDGET_USD": "2",
+        "CARPE_MAX_PER_CALL_USD": "0.25"
+      }
+    }
+  }
+}
