@@ -34,7 +34,7 @@ jobs:
   contract:
     name: Live API contract (free)
     runs-on: ubuntu-latest
-    # Carpe Diem answers 451 to US IPs; GitHub-hosted runners may be refused.
+    # Live production API: a transient outage there must not block a merge.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
