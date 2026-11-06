@@ -61,7 +61,9 @@ export class SpendGuard {
   fail(hold: SpendHold, err: unknown): void {
     this.close(hold)
     const certainlyNotRun = err instanceof CarpeError && err.notExecuted
-    if (!certainlyNotRun && hold.estimateUsd !== undefined) this.record(`${hold.tool} (failed, possibly billed)`, undefined, hold.estimateUsd)
+    // Fail closed: without an estimate, count what was reserved (the per-call cap).
+    const usd = hold.estimateUsd ?? (hold.amount > 0 ? hold.amount : undefined)
+    if (!certainlyNotRun && usd !== undefined) this.record(`${hold.tool} (failed, possibly billed)`, undefined, usd)
   }
 
   private close(hold: SpendHold): void {

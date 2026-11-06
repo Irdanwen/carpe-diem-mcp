@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ConfigError, loadConfig, paymentMode } from '../src/config.js'
-import { errorFromBody } from '../src/errors.js'
+import { errorFromBody, LocalRefusal } from '../src/errors.js'
 import { aggregateChatStream } from '../src/sse.js'
 import { estimateInputTokens, SpendGuard } from '../src/spend-guard.js'
 import { decodeJob, encodeJob, routeInfo } from '../src/tools/context.js'
@@ -89,6 +89,12 @@ test('spend guard: per-call and session limits, unknown costs', () => {
   g.record('t', { status: 200, costUsd: 0.3 })
   assert.throws(() => g.check('t', 0.31), /session budget/)
   assert.throws(() => g.check('t', undefined), /cannot be estimated/)
+  // An ambiguous failure counts as possibly billed — the estimate, or the reserved per-call cap when unknown.
+  const g2 = new SpendGuard(cfg)
+  g2.fail(g2.reserve('t', undefined), new Error('socket hang up'))
+  assert.equal(g2.spentUsd, 0.5)
+  g2.fail(g2.reserve('t', 0.1), new LocalRefusal('X', 'never sent'))
+  assert.equal(g2.spentUsd, 0.5)
   const unlimited = new SpendGuard(loadConfig({ CARPE_MAX_SPEND_USD: '0', CARPE_MAX_PER_CALL_USD: '0' }))
   unlimited.check('t', 1000)
 })

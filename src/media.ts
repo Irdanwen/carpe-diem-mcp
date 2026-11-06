@@ -75,7 +75,9 @@ type LookupCb = (err: NodeJS.ErrnoException | null, address: string | LookupAddr
  * socket's own DNS lookup, so a rebinding cannot swap it after the check — and
  * each redirect hop goes through the same check.
  */
-export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redirects = 3): Promise<{ bytes: Buffer; contentType: string }> {
+export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redirects = 3, deadline = Date.now() + 60_000): Promise<{ bytes: Buffer; contentType: string }> {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return Promise.reject(new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} timed out.`))
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return Promise.reject(new LocalRefusal('URL_REFUSED', 'Only http(s) URLs are accepted.'))
   if (strict && isPrivateHost(url.hostname)) return Promise.reject(new LocalRefusal('URL_REFUSED', 'Private, loopback and local hosts are refused in HTTP mode.'))
   const lookup = strict
@@ -89,12 +91,13 @@ export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redire
       }
     : undefined
   return new Promise((resolve, reject) => {
-    const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { method: 'GET', lookup: lookup as never, timeout: 60_000, headers: { 'user-agent': 'carpe-diem-mcp' } }, (res) => {
+    // One deadline for the whole download, redirects included (an idle timeout alone lets a slow server drip forever).
+    const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { method: 'GET', lookup: lookup as never, signal: AbortSignal.timeout(remaining), headers: { 'user-agent': 'carpe-diem-mcp' } }, (res) => {
       const status = res.statusCode ?? 0
       if (status >= 300 && status < 400 && res.headers.location) {
         res.resume()
         if (redirects <= 0) return reject(new LocalRefusal('URL_FETCH_FAILED', 'Too many redirects.'))
-        return resolve(fetchBounded(new URL(res.headers.location, url), maxBytes, strict, redirects - 1))
+        return resolve(fetchBounded(new URL(res.headers.location, url), maxBytes, strict, redirects - 1, deadline))
       }
       if (status < 200 || status >= 300) {
         res.resume()
@@ -115,11 +118,10 @@ export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redire
         } else chunks.push(c)
       })
       res.on('end', () => resolve({ bytes: Buffer.concat(chunks, total), contentType: String(res.headers['content-type'] ?? '') }))
-      res.on('error', reject)
+      res.on('error', (e: Error) => reject(e.name === 'AbortError' ? new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} timed out.`) : e))
     })
-    req.on('timeout', () => req.destroy(new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} timed out.`)))
     req.on('error', (e: NodeJS.ErrnoException) =>
-      reject(e instanceof LocalRefusal ? e : e.code === 'URL_REFUSED' ? new LocalRefusal('URL_REFUSED', 'The URL resolves to a private or loopback address; refused in HTTP mode.') : new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} failed: ${e.message}`)),
+      reject(e instanceof LocalRefusal ? e : e.name === 'AbortError' ? new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} timed out.`) : e.code === 'URL_REFUSED' ? new LocalRefusal('URL_REFUSED', 'The URL resolves to a private or loopback address; refused in HTTP mode.') : new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} failed: ${e.message}`)),
     )
     req.end()
   })
