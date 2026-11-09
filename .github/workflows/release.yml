@@ -1,9 +1,13 @@
 name: Release
 
-# Publishes to npm when a tag vX.Y.Z is pushed, through npm Trusted Publishing
-# (OIDC): no npm token or OTP is stored anywhere. One-time setup on npmjs.com:
-# package carpe-diem-mcp → Settings → Trusted publishing → GitHub Actions,
-# repository Irdanwen/carpe-diem-mcp, workflow file release.yml.
+# Stages the release on npm when a tag vX.Y.Z is pushed, through npm Trusted
+# Publishing (OIDC): no npm token or OTP is stored anywhere. The trusted
+# publisher only has the "npm stage publish" permission, so CI can stage a
+# version but never make it public: a maintainer approves it with 2FA
+# (`npm stage list carpe-diem-mcp`, then `npm stage approve <stage-id>`, or the
+# package page on npmjs.com). One-time setup on npmjs.com: package
+# carpe-diem-mcp → Settings → Trusted publishing → GitHub Actions, this
+# repository, workflow file release.yml.
 
 on:
   push:
@@ -28,4 +32,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: test "v$(node -p "require('./package.json').version")" = "$TAG"
-      - run: npm publish --access public --provenance
+      - run: npm run build
+      # `npm stage` ships with npm 12; pinned so the command cannot change under us.
+      - name: Stage the release (approval with 2FA on npmjs.com publishes it)
+        run: npx -y npm@12.2.2 stage publish --access public --provenance
