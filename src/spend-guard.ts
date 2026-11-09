@@ -34,7 +34,10 @@ export class SpendGuard {
   private pending = 0
   private readonly history: SpendRecord[] = []
 
-  constructor(private readonly cfg: Config) {}
+  constructor(
+    private readonly cfg: Config,
+    private readonly scopeNote = 'Session = since this MCP server started.',
+  ) {}
 
   get spentUsd(): number {
     return this.spent
@@ -113,7 +116,7 @@ export class SpendGuard {
       per_call_limit_usd: this.cfg.maxPerCallUsd > 0 ? this.cfg.maxPerCallUsd : null,
       by_tool: Object.fromEntries(Object.entries(byTool).map(([k, v]) => [k, { calls: v.calls, usd: round(v.usd) }])),
       recent: this.history.slice(-10).map((h) => ({ ...h, usd: round(h.usd) })),
-      note: 'Session = since this MCP server started. Costs come from the operator response headers; entries marked estimated had no reported cost.',
+      note: `${this.scopeNote} Costs come from the operator response headers; entries marked estimated had no reported cost.`,
     }
   }
 }

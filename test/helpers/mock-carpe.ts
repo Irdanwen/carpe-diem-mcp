@@ -27,8 +27,13 @@ export interface MockCarpe {
   calls: Recorded[]
   counters: Record<string, number>
   x402: { challengeOverride?: Record<string, unknown>; pricedMicros: number; billedMicros: number; payer?: string }
+  /** OAuth access tokens accepted like a key (the operator side of lot B2). */
+  oauthTokens: Set<string>
   close: () => Promise<void>
 }
+
+/** A PNG above the 4 MiB inline limit of the hosted server. */
+export const BIG_PNG = Buffer.concat([PNG, Buffer.alloc(5 * 1024 * 1024, 7)])
 
 const challenge = (resource: string, micros: number, override?: Record<string, unknown>) => ({
   x402Version: 1,
@@ -99,6 +104,7 @@ export async function startMockCarpe(): Promise<MockCarpe> {
   const calls: Recorded[] = []
   const counters: Record<string, number> = {}
   const x402: MockCarpe['x402'] = { pricedMicros: 261, billedMicros: 0 }
+  const oauthTokens = new Set<string>()
   let musicClaimed = false
   let imagePolls = 0
   const bump = (k: string) => (counters[k] = (counters[k] ?? 0) + 1)
@@ -108,7 +114,8 @@ export async function startMockCarpe(): Promise<MockCarpe> {
     const p = url.pathname.replace(/^\/api\/operator/, '')
     const body = req.method === 'POST' ? await readBody(req) : undefined
     calls.push({ method: req.method ?? 'GET', path: p, headers: req.headers, body })
-    const authed = req.headers.authorization === `Bearer ${KEY}`
+    const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
+    const authed = bearer === KEY || (bearer !== undefined && oauthTokens.has(bearer))
     const needKey = () => {
       if (!authed) {
         send(res, 401, { error: 'Unauthorized', code: 'AUTH_REQUIRED' })
@@ -257,7 +264,11 @@ export async function startMockCarpe(): Promise<MockCarpe> {
 
       case 'POST /v1/image/generate':
         if (!needKey()) return
-        return send(res, 200, { images: [PNG.toString('base64')], format: 'png' }, cost(5300))
+        return send(res, 200, { images: [(body.model === 'huge-image' ? BIG_PNG : PNG).toString('base64')], format: 'png' }, cost(5300))
+      case 'POST /v1/image/share':
+        if (!needKey()) return
+        if (!body?.data) return send(res, 400, { error: 'Missing image data' })
+        return send(res, 200, { id: `img-1-abc.${String(body.mime ?? 'image/png').split('/')[1]}` })
       case 'POST /v1/image/generate/queue':
         if (!needKey()) return
         return send(res, 202, { queue_id: 'img-q1', status: 'pending' }, cost(900000))
@@ -320,6 +331,7 @@ export async function startMockCarpe(): Promise<MockCarpe> {
     calls,
     counters,
     x402,
+    oauthTokens,
     close: () => new Promise<void>((r) => server.close(() => r())),
   }
 }

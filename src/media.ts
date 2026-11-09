@@ -4,6 +4,8 @@
  * Security: in HTTP mode the server may be reached by remote clients, so local
  * file reads are off and URL inputs are limited to public http(s) hosts
  * (literal private / loopback addresses and localhost names are refused).
+ * Remote (hosted) mode is stricter still: https URLs and data: URIs only, and
+ * nothing is ever written to disk.
  */
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
@@ -19,6 +21,8 @@ export interface MediaPolicy {
   allowLocalFiles: boolean
   outputDir: string | undefined
   maxInputBytes: number
+  /** Hosted mode: https and data: inputs only (redirect hops included), no file output. */
+  remote?: boolean
 }
 
 export interface LoadedMedia {
@@ -75,10 +79,11 @@ type LookupCb = (err: NodeJS.ErrnoException | null, address: string | LookupAddr
  * socket's own DNS lookup, so a rebinding cannot swap it after the check — and
  * each redirect hop goes through the same check.
  */
-export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redirects = 3, deadline = Date.now() + 60_000): Promise<{ bytes: Buffer; contentType: string }> {
+export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redirects = 3, deadline = Date.now() + 60_000, httpsOnly = false): Promise<{ bytes: Buffer; contentType: string }> {
   const remaining = deadline - Date.now()
   if (remaining <= 0) return Promise.reject(new LocalRefusal('URL_FETCH_FAILED', `Fetching ${url.host} timed out.`))
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return Promise.reject(new LocalRefusal('URL_REFUSED', 'Only http(s) URLs are accepted.'))
+  if (httpsOnly && url.protocol !== 'https:') return Promise.reject(new LocalRefusal('URL_REFUSED', 'Only https:// URLs are accepted by the hosted server.'))
   if (strict && isPrivateHost(url.hostname)) return Promise.reject(new LocalRefusal('URL_REFUSED', 'Private, loopback and local hosts are refused in HTTP mode.'))
   const lookup = strict
     ? (hostname: string, options: LookupOptions, cb: LookupCb) => {
@@ -97,7 +102,7 @@ export function fetchBounded(url: URL, maxBytes: number, strict: boolean, redire
       if (status >= 300 && status < 400 && res.headers.location) {
         res.resume()
         if (redirects <= 0) return reject(new LocalRefusal('URL_FETCH_FAILED', 'Too many redirects.'))
-        return resolve(fetchBounded(new URL(res.headers.location, url), maxBytes, strict, redirects - 1, deadline))
+        return resolve(fetchBounded(new URL(res.headers.location, url), maxBytes, strict, redirects - 1, deadline, httpsOnly))
       }
       if (status < 200 || status >= 300) {
         res.resume()
@@ -138,10 +143,11 @@ export async function loadMedia(input: string, policy: MediaPolicy, fallbackMime
     return { bytes, mime: data[1] ?? sniffMime(bytes) ?? fallbackMime ?? 'application/octet-stream' }
   }
   if (/^https?:\/\//i.test(s)) {
-    const { bytes, contentType } = await fetchBounded(new URL(s), policy.maxInputBytes, !policy.allowLocalFiles)
+    const { bytes, contentType } = await fetchBounded(new URL(s), policy.maxInputBytes, !policy.allowLocalFiles || !!policy.remote, 3, Date.now() + 60_000, !!policy.remote)
     const ct = contentType.split(';')[0].trim()
     return { bytes, mime: sniffMime(bytes) ?? (ct && ct !== 'application/octet-stream' ? ct : fallbackMime ?? 'application/octet-stream') }
   }
+  if (policy.remote) throw new LocalRefusal('LOCAL_FILES_DISABLED', 'Pass a data: URI or an https:// URL: the hosted server cannot read files on your machine.')
   if (!policy.allowLocalFiles) throw new LocalRefusal('LOCAL_FILES_DISABLED', 'Pass a data: URI or an https:// URL (local paths are disabled in HTTP mode).')
   const path = s.startsWith('~/') ? join(homedir(), s.slice(2)) : isAbsolute(s) ? s : resolve(s)
   let size: number
@@ -155,6 +161,22 @@ export async function loadMedia(input: string, policy: MediaPolicy, fallbackMime
   return { bytes, mime: sniffMime(bytes) ?? fallbackMime ?? 'application/octet-stream' }
 }
 
+/**
+ * A URL handed to the operator verbatim (the operator fetches it). Remote mode
+ * only accepts https URLs naming a public host; other modes pass it unchanged.
+ */
+export function checkPassThroughUrl(input: string, policy: MediaPolicy): void {
+  if (!policy.remote) return
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    throw new LocalRefusal('URL_REFUSED', 'Not a valid URL.')
+  }
+  if (url.protocol !== 'https:') throw new LocalRefusal('URL_REFUSED', 'Only https:// URLs are accepted by the hosted server.')
+  if (isPrivateHost(url.hostname)) throw new LocalRefusal('URL_REFUSED', 'Private, loopback and local hosts are refused.')
+}
+
 export const toDataUri = (m: LoadedMedia) => `data:${m.mime};base64,${m.bytes.toString('base64')}`
 
 /** Decode a base64 image the operator returned (raw or data URI). */
@@ -166,6 +188,7 @@ export function decodeBase64Media(s: string): LoadedMedia {
 
 /** Write media to CARPE_OUTPUT_DIR (or the temp dir when `force`). Returns the path. */
 export function saveMedia(media: LoadedMedia, prefix: string, policy: MediaPolicy, force = false): string | undefined {
+  if (policy.remote) return undefined
   const dir = policy.outputDir ?? (force ? join(tmpdir(), 'carpe-mcp') : undefined)
   if (!dir) return undefined
   mkdirSync(dir, { recursive: true })

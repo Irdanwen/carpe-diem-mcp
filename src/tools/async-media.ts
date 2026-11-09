@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { CarpeError, LocalRefusal } from '../errors.js'
-import { loadMedia, sniffMime, toDataUri } from '../media.js'
+import { checkPassThroughUrl, loadMedia, sniffMime, toDataUri } from '../media.js'
 import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, routeInfo, safe, surfaceOf, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
 import { pollJob } from './jobs.js'
 
@@ -15,7 +15,7 @@ const WAIT = (def: number) => z.number().int().min(0).max(600).optional().descri
 
 /** Price a video payload for free: /v1/video/quote with a key, or the unpaid x402 challenge. */
 async function quoteVideo(ctx: ToolContext, body: Record<string, unknown>): Promise<{ usd?: number; raw?: unknown }> {
-  if (ctx.client.mode === 'api_key') {
+  if (ctx.client.usesBearer) {
     const res = await ctx.client.request({ method: 'POST', path: '/v1/video/quote', json: body, auth: 'account', retry: 'read' })
     const q = res.json<{ cost_usdc?: number | string; quote?: number | string }>()
     const usd = Number(q.cost_usdc ?? q.quote)
@@ -46,8 +46,22 @@ async function download(ctx: ToolContext, url: string, maxBytes: number): Promis
 
 async function resolveMediaField(ctx: ToolContext, v: unknown, maxBytes: number): Promise<unknown> {
   if (typeof v !== 'string') return v
-  if (/^(https?:|data:)/i.test(v)) return v
+  if (/^data:/i.test(v)) return v
+  if (/^https?:/i.test(v)) {
+    checkPassThroughUrl(v, ctx.media)
+    return v
+  }
   return toDataUri(await loadMedia(v, { ...ctx.media, maxInputBytes: maxBytes }))
+}
+
+/** Remote mode: a finished file stays on the operator; the user gets its temporary link. */
+function remoteLink(kind: 'video' | 'music', handle: string, surface: JobSurface, url: string, mime: string, expires: string): CallToolResult {
+  const note = 'Temporary link served by Carpe Diem: open or download it soon. Longer-lived storage is not available yet on the hosted server.'
+  return ok(
+    `${kind === 'video' ? 'Video' : 'Music'} ready: ${url}\nExpires ${expires}. ${note}`,
+    { job_id: handle, status: 'completed', [kind === 'video' ? 'video' : 'audio']: { url, mime_type: mime, expires, note }, remote_url: url, surface },
+    [{ type: 'resource_link', uri: url, name: kind === 'video' ? 'video.mp4' : 'music', mimeType: mime }],
+  )
 }
 
 export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
@@ -76,13 +90,16 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
       const url = (r.status?.video_url ?? r.status?.download_url ?? r.status?.url) as string | undefined
       if (!url) return ok('Video completed but no file URL was returned.', { job_id: handle, status: 'completed', upstream: r.status })
       remote = ctx.client.absoluteUrl(url)
+      // Hosted server: no disk, so hand the operator's short-lived link over instead of downloading it.
+      if (ctx.media.remote) return remoteLink('video', handle, job.surface, remote, 'video/mp4', 'about 10 minutes after completion')
       // The file is served by its opaque id for ~10 minutes: download it now.
       bytes = await download(ctx, remote, ctx.cfg.maxVideoBytes)
     }
     const media = { bytes, mime: sniffMime(bytes) ?? 'video/mp4' }
-    const out = mediaOutput(ctx, media, 'video', { forceSave: true })
+    const out = await mediaOutput(ctx, media, 'video', { forceSave: true })
+    const where = out.info.file ?? out.info.note
     return ok(
-      `Video ready: ${out.info.file}${remote ? `\nRemote copy (expires ~10 min after completion): ${remote}` : ''}`,
+      `Video ready: ${where}${remote ? `\nRemote copy (expires ~10 min after completion): ${remote}` : ''}`,
       { job_id: handle, status: 'completed', video: out.info, ...(remote ? { remote_url: remote } : {}), surface: job.surface },
       out.content,
     )
@@ -104,12 +121,13 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
     if (!bytes) {
       const url = (r.status?.audio_url ?? r.status?.download_url ?? r.status?.url) as string | undefined
       if (!url) return ok('Music completed but no audio was returned.', { job_id: handle, status: 'completed', upstream: r.status })
+      if (ctx.media.remote) return remoteLink('music', handle, job.surface, ctx.client.absoluteUrl(url), 'audio/mpeg', 'set by the operator (short-lived)')
       bytes = await download(ctx, ctx.client.absoluteUrl(url), ctx.cfg.maxMediaBytes)
     }
     const media = { bytes, mime: sniffMime(bytes) ?? r.res?.contentType ?? 'audio/mpeg' }
-    // On /v1 a finished track can be claimed only once: always keep a copy on disk.
-    const out = mediaOutput(ctx, media, 'music', { forceSave: true })
-    return ok(`Music ready: ${out.info.file}`, { job_id: handle, status: 'completed', audio: out.info, surface: job.surface }, out.content)
+    // On /v1 a finished track can be claimed only once: always keep a copy on disk (inline only in remote mode).
+    const out = await mediaOutput(ctx, media, 'music', { forceSave: true })
+    return ok(`Music ready${out.info.file ? `: ${out.info.file}` : out.info.inline ? ' (inline audio)' : `: ${out.info.note}`}`, { job_id: handle, status: 'completed', audio: out.info, surface: job.surface }, out.content)
   }
 
   return [

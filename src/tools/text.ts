@@ -85,7 +85,7 @@ export function textTools(ctx: ToolContext): ToolDef[] {
         let completion: Record<string, any> = {}
         let meta: CallMeta = { status: 0 }
         try {
-        if (ctx.client.mode === 'api_key') {
+        if (ctx.client.usesBearer) {
           const path = surface === 'router' ? '/router/chat/completions' : '/v1/chat/completions'
           const r = await ctx.client.openStream({
             path,

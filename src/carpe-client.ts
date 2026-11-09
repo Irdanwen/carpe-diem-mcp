@@ -7,6 +7,9 @@
  * - Turns every error shape into a CarpeError (see errors.ts).
  * - Parses the cost / route / payment headers into `meta`.
  * - Pays either with the API key or, in x402 mode, with the session permit.
+ * - Remote mode (`oauth`): relays the signed-in user's access token verbatim
+ *   (`Authorization: Bearer <token>`) on account and paid routes only; the
+ *   operator resolves it to the connector's own key. No key is held here.
  *
  * Retry policy — the one place double billing could come from, so it is strict:
  *   read  : GETs and free POSTs (quote): up to 2 retries on transient failures.
@@ -174,6 +177,9 @@ async function readBounded(res: Response, maxBytes: number): Promise<Buffer> {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const MAX_RETRY_WAIT_MS = 10_000
 
+/** Remote mode: returns the access token of the user this client acts for (undefined = none). */
+export type BearerSource = () => string | undefined
+
 export class CarpeClient {
   readonly mode: PaymentMode
   private readonly userAgent: string
@@ -182,9 +188,24 @@ export class CarpeClient {
     readonly cfg: Config,
     private readonly x402: X402Session | undefined = undefined,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly userToken: BearerSource | undefined = undefined,
   ) {
     this.mode = paymentMode(cfg)
     this.userAgent = `${cfg.serverName}/${cfg.serverVersion}`
+  }
+
+  /** API key or relayed OAuth token: the operator's Bearer routes (streaming, quotes) are available. */
+  get usesBearer(): boolean {
+    return this.mode === 'api_key' || this.mode === 'oauth'
+  }
+
+  /**
+   * The Bearer credential for account / paid routes. Remote mode never falls
+   * back to a server-held key: only the user's token is ever sent.
+   */
+  private bearer(): string | undefined {
+    if (this.mode === 'oauth') return this.userToken?.() || undefined
+    return this.cfg.apiKey
   }
 
   /** Absolute URL for a path the operator returned relative (e.g. video_url). */
@@ -247,7 +268,20 @@ export class CarpeClient {
         /* keep text */
       }
     }
-    return errorFromBody(res.status, body, res.headers)
+    const err = errorFromBody(res.status, body, res.headers)
+    if (this.mode === 'oauth' && err.status === 401) {
+      // The API-key hint (set CARPE_API_KEY) means nothing to a hosted connector's user.
+      return new CarpeError({
+        status: err.status,
+        code: err.code,
+        message: err.message,
+        retryAfterMs: err.retryAfterMs,
+        details: err.details,
+        notExecuted: err.notExecuted,
+        hint: 'Carpe Diem refused this connection (expired, revoked, or not allowed for this route). Reconnect the Carpe Diem connector in your client; connectors are listed and revocable in API → Keys.',
+      })
+    }
+    return err
   }
 
   private buildUrl(path: string, query?: RequestOptions['query']): string {
@@ -261,13 +295,20 @@ export class CarpeClient {
     let path = opts.path
     let usingX402 = false
 
-    if (opts.auth === 'account' || opts.auth === 'optional' || (opts.auth === 'paid' && this.mode === 'api_key')) {
+    if (this.mode === 'oauth') {
+      // The user's token goes only to the routes that need an account; public reads stay anonymous.
+      if (opts.auth === 'account' || opts.auth === 'paid') {
+        const token = this.bearer()
+        if (!token) throw new LocalRefusal('NOT_AUTHENTICATED', 'No signed-in Carpe Diem account for this request.', 'Reconnect the Carpe Diem connector in your client.')
+        headers.authorization = `Bearer ${token}`
+      }
+    } else if (opts.auth === 'account' || opts.auth === 'optional' || (opts.auth === 'paid' && this.mode === 'api_key')) {
       if (this.cfg.apiKey) headers.authorization = `Bearer ${this.cfg.apiKey}`
       else if (opts.auth === 'account') {
         throw new LocalRefusal('API_KEY_REQUIRED', 'This tool reads a Carpe Diem account and needs CARPE_API_KEY (x402 wallets have no account).')
       }
     }
-    if (opts.auth === 'paid' && this.mode !== 'api_key') {
+    if (opts.auth === 'paid' && !this.usesBearer) {
       if (this.mode === 'none' || !this.x402) {
         throw new LocalRefusal(
           'NO_PAYMENT_METHOD',
@@ -314,12 +355,16 @@ export class CarpeClient {
    * operator certainly did not execute it. A JSON answer is returned as `json`.
    */
   async openStream(opts: Omit<RequestOptions, 'auth'>): Promise<{ meta: CallMeta; headers: Headers; stream?: ReadableStream<Uint8Array>; json?: unknown }> {
-    if (!this.cfg.apiKey) throw new LocalRefusal('API_KEY_REQUIRED', 'Streaming needs CARPE_API_KEY.')
+    const token = this.bearer()
+    if (!token) {
+      if (this.mode === 'oauth') throw new LocalRefusal('NOT_AUTHENTICATED', 'No signed-in Carpe Diem account for this request.', 'Reconnect the Carpe Diem connector in your client.')
+      throw new LocalRefusal('API_KEY_REQUIRED', 'Streaming needs CARPE_API_KEY.')
+    }
     for (let attempt = 1; ; attempt++) {
       const headers: Record<string, string> = {
         'user-agent': this.userAgent,
         accept: 'text/event-stream, application/json',
-        authorization: `Bearer ${this.cfg.apiKey}`,
+        authorization: `Bearer ${token}`,
         'content-type': 'application/json',
         ...(opts.idempotencyKey ? { 'idempotency-key': opts.idempotencyKey } : {}),
       }

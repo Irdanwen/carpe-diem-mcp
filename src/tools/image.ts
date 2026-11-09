@@ -37,12 +37,14 @@ function urlsFromJson(body: unknown): string[] {
 }
 
 export function imageTools(ctx: ToolContext): ToolDef[] {
-  const finish = (tool: string, _res: CarpeResponse | undefined, images: LoadedMedia[], urls: string[], structured: Record<string, unknown>): CallToolResult => {
-    const outputs = images.map((m, i) => mediaOutput(ctx, m, `${tool.replace('carpe_', '')}-${i + 1}`))
+  const finish = async (tool: string, _res: CarpeResponse | undefined, images: LoadedMedia[], urls: string[], structured: Record<string, unknown>): Promise<CallToolResult> => {
+    const outputs = await Promise.all(images.map((m, i) => mediaOutput(ctx, m, `${tool.replace('carpe_', '')}-${i + 1}`)))
     const content = outputs.flatMap((o) => o.content)
     const info: Record<string, unknown> = { ...structured, images: outputs.map((o) => o.info), ...(urls.length ? { image_urls: urls } : {}) }
     const files = outputs.map((o) => o.info.file).filter(Boolean)
-    const lead = `${images.length + urls.length} image(s) from ${structured.model ?? 'the model'}${files.length ? ` — saved to ${files.join(', ')}` : ''}${urls.length ? `\n${urls.join('\n')}` : ''}`
+    const links = [...outputs.map((o) => o.info.url).filter(Boolean), ...urls]
+    const notes = outputs.map((o) => o.info.note).filter(Boolean)
+    const lead = `${images.length + urls.length} image(s) from ${structured.model ?? 'the model'}${files.length ? ` — saved to ${files.join(', ')}` : ''}${links.length ? `\n${links.join('\n')}` : ''}${notes.length ? `\n${notes.join('\n')}` : ''}`
     return ok(`${lead}\n${JSON.stringify({ cost: info.cost, route: info.route }, null, 0)}`, info, content)
   }
 
