@@ -216,6 +216,6 @@ A restart (update or rollback) empties the temporary media store: its links answ
 
 - Port 3333 published on loopback only; Nginx is the only way in, with per-IP request ceilings in front of token verification (`/mcp` and the metadata, `/media/`, `/health`; all answer `429`). Nginx replaces the client's `X-Forwarded-For` / `X-Real-IP` with the real address instead of passing them on.
 - Read-only root filesystem, `/tmp` as a small tmpfs, all capabilities dropped, `no-new-privileges`, memory and PID limits. The code is owned by root and runs as `node`, under a minimal init (`init: true`) so a stop or an update does not wait 10 s for SIGKILL.
-- Request bodies: a global and a per-user budget, a 30 s receive deadline, and the server's own `headersTimeout` / `requestTimeout` (see the main README, "Rate and memory limits").
+- Request bodies: a global and a per-user budget (64 MB and 48 MB by default), a 30 s receive deadline, the server's own `headersTimeout` / `requestTimeout`, and a count of JSON values before any parsing (`413` above 100 000, so a body of millions of tiny values never reaches `JSON.parse`). Tool calls in progress are capped per user, each call of a batch counted. See the main README, "Rate and memory limits".
 - The base image is pinned by digest (`ARG NODE_IMAGE` in the `Dockerfile`).
 - The server refuses to start with any credential in its environment (`CARPE_API_KEY`, `CARPE_X402_*`, `CARPE_MCP_AUTH_TOKEN`) or with `CARPE_OUTPUT_DIR`.
