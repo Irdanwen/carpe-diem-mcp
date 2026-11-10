@@ -9,7 +9,10 @@
  *   - has `aud` naming this server's resource URL (RFC 8707). Without this
  *     check a token minted for another service (e.g. an id_token for a website
  *     client) could be replayed here: token confusion;
- *   - has `exp` (and `nbf` / `iat` when present) valid within a small skew;
+ *   - is an access token: header `typ: at+jwt` (RFC 9068 §4), so an id_token
+ *     or another JWT of the same issuer is refused even with the right `aud`;
+ *   - is not expired: `exp` is enforced to the second, as the operator does
+ *     (the skew only applies to `nbf` / `iat`, i.e. to a token from the future);
  *   - has a `sub`: every session and spend guard is keyed by it.
  *
  * jose does the JWS work. It is already installed as a dependency of
@@ -40,6 +43,7 @@ export function scopesOf(payload: JWTPayload): string[] {
 function describe(err: unknown): InvalidTokenError | ServerError {
   if (err instanceof joseErrors.JWTExpired) return new InvalidTokenError('Token has expired')
   if (err instanceof joseErrors.JWTClaimValidationFailed) {
+    if (err.claim === 'typ') return new InvalidTokenError('Not an access token')
     if (err.claim === 'iss') return new InvalidTokenError('Unexpected token issuer')
     if (err.claim === 'nbf' || err.claim === 'iat') return new InvalidTokenError('Token is not valid yet')
     if (err.claim === 'sub') return new InvalidTokenError('Token has no subject')
@@ -90,17 +94,23 @@ export class JwtAccessTokenVerifier implements OAuthTokenVerifier {
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     let payload: JWTPayload
+    const skew = this.rc.clockToleranceSec
     try {
       const keys = await this.keySet()
       ;({ payload } = await jwtVerify(token, keys, {
         issuer: this.rc.issuer,
         algorithms: this.rc.algorithms,
-        clockTolerance: this.rc.clockToleranceSec,
+        typ: 'at+jwt',
+        // jose applies the tolerance to exp too: exp is checked again below, without it.
+        clockTolerance: skew,
         requiredClaims: ['exp', 'sub'],
       }))
     } catch (err) {
       throw describe(err)
     }
+    const now = Math.floor(Date.now() / 1000)
+    if (typeof payload.exp !== 'number' || payload.exp <= now) throw new InvalidTokenError('Token has expired')
+    if (typeof payload.iat === 'number' && payload.iat > now + skew) throw new InvalidTokenError('Token is not valid yet')
     const aud = Array.isArray(payload.aud) ? payload.aud : payload.aud !== undefined ? [payload.aud] : []
     if (!aud.some((a) => typeof a === 'string' && sameResource(a, this.rc.resource))) {
       throw new InvalidTokenError('Token was not issued for this resource')
@@ -110,8 +120,8 @@ export class JwtAccessTokenVerifier implements OAuthTokenVerifier {
       token,
       clientId: typeof payload.client_id === 'string' ? payload.client_id : typeof payload.azp === 'string' ? payload.azp : '',
       scopes: scopesOf(payload),
-      // requireBearerAuth compares this with the clock again, without skew: hand it the tolerated expiry.
-      expiresAt: (payload.exp as number) + this.rc.clockToleranceSec,
+      // The real expiry: requireBearerAuth compares it with the clock again, without skew.
+      expiresAt: payload.exp,
       resource: new URL(this.rc.resource),
       extra: { sub: payload.sub },
     }

@@ -25,7 +25,7 @@ export interface RemoteConfig {
   jwksUrl: string | undefined
   /** Accepted JWS algorithms (default ES256, the issuer's signing algorithm). */
   algorithms: string[]
-  /** Clock skew tolerated on exp / nbf / iat, in seconds. */
+  /** Clock skew tolerated on nbf / iat (a token from the future), in seconds. Never on exp. */
   clockToleranceSec: number
   /** Token bucket per user: sustained requests per minute and burst size. */
   ratePerMinute: number

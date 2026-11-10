@@ -190,6 +190,10 @@ describe('discovery and token validation', () => {
       ['nbf in the future', await tokenFor(srv, { notBefore: 600 })],
       ['bad signature', await tokenFor(srv, { rogueKey: true })],
       ['garbage', 'not-a-jwt'],
+      ['typ JWT (an id_token, not an access token)', await tokenFor(srv, { typ: 'JWT' })],
+      ['no typ', await tokenFor(srv, { typ: null })],
+      ['expired 5 s ago (no skew on exp)', await tokenFor(srv, { expiresIn: -5 })],
+      ['issued 10 min in the future', await tokenFor(srv, { issuedAt: 600 })],
     ]
     for (const [label, token] of cases) {
       const res = await rpc(srv, token, INIT)
@@ -198,9 +202,19 @@ describe('discovery and token validation', () => {
       assert.match(res.headers.get('www-authenticate') ?? '', /resource_metadata="/, label)
     }
     assert.equal(mock.calls.length, before, 'no rejected token reached the operator')
-    // Small clock skew is tolerated.
-    const skewed = await tokenFor(srv, { expiresIn: -5 })
-    assert.equal((await rpc(srv, skewed, INIT)).status, 200)
+    // A small clock skew is tolerated on nbf / iat (the issuer's clock a little ahead), never on exp.
+    assert.equal((await rpc(srv, await tokenFor(srv, { notBefore: 5, issuedAt: 5 }), INIT)).status, 200)
+    assert.equal((await rpc(srv, await tokenFor(srv, { typ: 'application/at+jwt' }), INIT)).status, 200)
+  })
+
+  test('the expiry handed to the SDK is the token\'s own exp, without the skew', async () => {
+    const { JwtAccessTokenVerifier } = await import('../src/remote/token.js')
+    const v = new JwtAccessTokenVerifier(loadRemoteConfig({ CARPE_OAUTH_ISSUER: issuer.url, CARPE_MCP_PUBLIC_URL: srv.url }))
+    const t = await issuer.mint({ aud: srv.url, expiresIn: 100 })
+    const exp = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8')).exp
+    assert.equal((await v.verifyAccessToken(t)).expiresAt, exp)
+    await assert.rejects(v.verifyAccessToken(await issuer.mint({ aud: srv.url, expiresIn: 0 })), /expired/)
+    await assert.rejects(v.verifyAccessToken(await issuer.mint({ aud: srv.url, typ: 'JWT' })), /Not an access token/)
   })
 
   test('an unreachable issuer is a server error (500), never an accepted token', async () => {

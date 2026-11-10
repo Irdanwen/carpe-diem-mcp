@@ -108,7 +108,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     } catch {
       /* not a JWT: keep it for the longest access-token life */
     }
-    const untilMs = typeof expSec === 'number' ? (expSec + rc.clockToleranceSec) * 1000 : Date.now() + 3600_000
+    const untilMs = typeof expSec === 'number' ? expSec * 1000 : Date.now() + 3600_000
     dead.add(token, untilMs)
   }
   const log = opts.log ?? stderrLogger
