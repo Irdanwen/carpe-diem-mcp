@@ -97,7 +97,7 @@ Each result includes `route: { surface, endpoint_prefix, route_used, tee, reason
 | Mode | Set | What happens |
 |---|---|---|
 | **API key** (recommended) | `CARPE_API_KEY=cdm_…` | Billed to your Carpe account (credits or prepaid rail). Account tools work. |
-| **x402** (no account) | `CARPE_X402_PRIVATE_KEY=0x…` + `CARPE_X402_BUDGET_USD=2` | Pays per request in USDC on Base with the `carpe-session` scheme: **one** EIP-2612 permit to the Carpe escrow, reused for every call. The permit value is the remaining budget, so **the escrow can never pull more than `CARPE_X402_BUDGET_USD` in total** — re-signing never resets the cap (before re-signing, what the escrow really pulled under the last permit is read on-chain and counted if it exceeds what was billed), and spend is persisted in `~/.carpe-mcp/` across restarts. Before signing, the challenge's network, USDC address and escrow are checked against pinned values. |
+| **x402** (no account) | `CARPE_X402_PRIVATE_KEY=0x…` + `CARPE_X402_BUDGET_USD=2` | Pays per request in USDC on Base with the `carpe-session` scheme: **one** EIP-2612 permit to the Carpe escrow, reused for every call. The operator pulls from the allowance already open before it applies a new permit, and a permit replaces the allowance instead of adding to it. So each permit is signed for the budget minus what was spent and minus the allowance still open to the escrow (both read at one block), and **the escrow can never pull more than `CARPE_X402_BUDGET_USD` in total through this server's permits**. "Spent" is what was billed, raised to what the chain shows was really pulled, so a relay that under-reports prices and forces re-signs gets nothing more. Two limits: the cap is the highest budget this wallet has had, since lowering it does not shrink an allowance already open or a permit already signed (valid 30 days); and spend lives in `~/.carpe-mcp/` (`CARPE_STATE_DIR`), so deleting that file starts a new budget. If the wallet already lets the escrow pull through an allowance this server did not grant (an `approve` or a permit from another app), nothing is signed until you revoke it. Before signing, the challenge's network, USDC address and escrow are checked against pinned values, and the RPC's chainId against the network. |
 
 The API key wins when both are set. Without either, free tools still work (catalogue, prices, quotes, markets, status).
 
@@ -135,7 +135,7 @@ Media inputs accept an `https://` URL, a `data:` URI, or (stdio only) a local pa
 |---|---|---|
 | `CARPE_API_KEY` | — | `cdm_…` key |
 | `CARPE_X402_PRIVATE_KEY` / `CARPE_X402_BUDGET_USD` | — | x402 mode (budget ≥ 0.10, required with the key) |
-| `CARPE_X402_RPC_URL` | `https://mainnet.base.org` | Reads the USDC permit nonce, balance and allowance to the escrow |
+| `CARPE_X402_RPC_URL` | `https://mainnet.base.org` | Reads the chainId (checked before signing), the USDC permit nonce and allowance to the escrow (at one block), and the balance |
 | `CARPE_MAX_SPEND_USD` / `CARPE_MAX_PER_CALL_USD` | `5` / `0.50` | Spend guard (`0` = off) |
 | `CARPE_DEFAULT_ROUTE` | `carpe` | `carpe` (`/v1`) or `router` (`/router`) |
 | `CARPE_DEFAULT_CHAT_MODEL` | `deepseek-v4-flash` | |
@@ -212,7 +212,7 @@ Not covered yet: the Anthropic-shaped `/v1/messages` (use `carpe_chat`), JEV dec
 Serveur MCP pour Carpe Diem. Il donne à un agent l'accès aux modèles Venice (texte, image, vidéo, voix, musique, embeddings, recherche web) via la place de marché Carpe Diem.
 
 - **Deux surfaces.** `route: "carpe"` passe par `/v1` : Carpe seul, toujours dans son TEE. `route: "router"` passe par `/router` : le marché le moins cher, éventuellement hors TEE. Chaque résultat indique le marché qui a servi la requête et si c'était un TEE.
-- **Deux modes de paiement.** Avec une clé API `cdm_`, la dépense est facturée au compte. En x402, un seul permit USDC est signé, et sa valeur est un plafond dur côté blockchain.
+- **Deux modes de paiement.** Avec une clé API `cdm_`, la dépense est facturée au compte. En x402, un permit USDC est signé pour ce qui reste du budget, allowance encore ouverte comprise : l'escrow ne peut pas prélever plus que le budget au total.
 - **Garde de dépense.** Le coût est estimé gratuitement avant chaque appel. L'appel est refusé localement au-delà de `CARPE_MAX_PER_CALL_USD` ou du budget de session `CARPE_MAX_SPEND_USD`.
 - **Mode distant (aperçu).** `--remote` sert plusieurs utilisateurs derrière OAuth, pour ChatGPT et claude.ai. Le serveur ne détient aucune clé : il relaie le jeton de chaque utilisateur à l'operator, n'écrit rien sur disque et ne journalise ni prompts ni jetons. Il attend le côté Carpe Diem (OAuth pour les clients MCP, acceptation du jeton par l'operator).
 

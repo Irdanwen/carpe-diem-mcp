@@ -322,7 +322,7 @@ describe('account, quote, errors, retries', () => {
 describe('x402 carpe-session', () => {
   const pk = generatePrivateKey()
   const env = { CARPE_X402_PRIVATE_KEY: pk, CARPE_X402_BUDGET_USD: '0.10' }
-  const deps = { readNonce: async () => 0n, readUsdcBalance: async () => 5_000_000n }
+  const deps = { readChainId: async () => 8453, readPermitState: async () => ({ nonce: 0n, allowance: 0n }), readUsdcBalance: async () => 5_000_000n }
 
   test('challenge → one signed permit (value = budget) → reused; price billed from X-Payment-Amount-Usdc', async () => {
     mock.x402.billedMicros = 0
