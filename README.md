@@ -207,7 +207,7 @@ CARPE_MCP_HOST=127.0.0.1 npx carpe-diem-mcp --remote --port 3333   # behind a TL
 
 `CARPE_MCP_HOST`, `PORT` and `CARPE_MCP_ALLOWED_ORIGINS` apply as in HTTP mode. Run it behind a TLS reverse proxy; http URLs are accepted for the issuer and the resource only on loopback (tests).
 
-Deployment (Docker image built from a release's verified commit, compose file, Nginx vhost with `/media/`, memory sizing, checks, monitoring, update and rollback): [`deploy/README.md`](deploy/README.md). Each release's notes give its commit sha (`Commit: <sha>`), which the procedures check against the tag.
+Deployment (Docker image built from a release's commit, compose file, Nginx vhost with `/media/`, memory sizing, checks, monitoring, update and rollback): [`deploy/README.md`](deploy/README.md). The release workflow writes each release's commit in its notes (`Commit: <sha>`), and the procedures check that the tag still names it: a consistency check between tag and notes, not an independent verification (both are editable by the same accounts; signed tags would be the next step).
 
 ## Development
 

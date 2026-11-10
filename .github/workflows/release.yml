@@ -9,17 +9,24 @@ name: Release
 # carpe-diem-mcp → Settings → Trusted publishing → GitHub Actions, this
 # repository, workflow file release.yml.
 
+#
+# Then it creates the GitHub release of the tag, whose notes carry the commit
+# (`Commit: <40-character sha>`): deploy/README.md builds the hosted server
+# from that commit and checks that the tag still names it.
+
 on:
   push:
     tags: ['v*.*.*']
 
-permissions:
-  contents: read
-  id-token: write
+# Nothing by default; each job asks for what it needs.
+permissions: {}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -36,3 +43,26 @@ jobs:
       # `npm stage` ships with npm 12; pinned so the command cannot change under us.
       - name: Stage the release (approval with 2FA on npmjs.com publishes it)
         run: npx -y npm@12.2.2 stage publish --access public --provenance
+
+  github-release:
+    # Only once the tests passed and the version was staged.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release, its notes naming the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" --json body --jq .body > existing.txt 2>/dev/null; then
+            # A re-run: the release must already name this commit; it is never rewritten.
+            grep -qx "Commit: $SHA" existing.txt || { echo "Release $TAG exists and does not name $SHA"; exit 1; }
+            exit 0
+          fi
+          printf 'Commit: %s\n\nThe hosted server is built from this commit (deploy/README.md, "Releases").\n' "$SHA" > notes.md
+          gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file notes.md

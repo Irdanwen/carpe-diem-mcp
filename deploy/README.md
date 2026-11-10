@@ -12,7 +12,11 @@ The server holds no credential and no durable data: each user's OAuth access tok
 
 ## Releases
 
-A release is a tag `vX.Y.Z` **and** its commit, written in the release notes on GitHub (`Commit: <40-character sha>`). The procedures below take the commit from the release notes, check that the tag still names it (a tag can be moved; a commit cannot), then build the image and download every file from that commit.
+A release is a tag `vX.Y.Z` **and** its commit, written in the release notes on GitHub (`Commit: <40-character sha>`). Pushing the tag runs `.github/workflows/release.yml`: once the tests pass and the npm version is staged, it creates the GitHub release of that tag with `Commit: <the sha the tag named when it was pushed>` in its notes (a re-run never rewrites them). The procedures below take the commit from the release notes, check that the tag still names it (a tag can be moved; a commit cannot), then build the image and download every file from that commit.
+
+What this check gives, plainly: **consistency** between the tag and the release notes, so a tag moved after the release (by mistake, or by someone who did not also edit the notes) stops the procedure, and everything is built and downloaded from one fixed commit. It is **not an independent verification**: the same GitHub accounts (maintainers, or a stolen token with `contents: write`) can move the tag and edit the notes alike, and then both agree on the wrong commit. The next step would be signed tags (`git tag -s`, checked with `git verify-tag` against the maintainers' keys before building), or the sha published somewhere those accounts cannot write.
+
+A tag pushed before the workflow created releases (`v0.2.0`) has none: install from the next release, or create it by hand from the sha the tag names (`git ls-remote https://github.com/Lumen-labs-ch/carpe-diem-mcp.git 'refs/tags/v0.2.0^{}' 'refs/tags/v0.2.0'`), with `gh release create v0.2.0 --verify-tag --notes "Commit: <sha>"`.
 
 ## Install
 
