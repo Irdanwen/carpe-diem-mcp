@@ -7,7 +7,7 @@ import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { extFor, saveMedia, type LoadedMedia, type MediaPolicy } from '../media.js'
 import { describeError, LocalRefusal } from '../errors.js'
-import type { Reservation } from '../remote/media-store.js'
+import type { Reservation, StoredMedia } from '../remote/media-store.js'
 
 export interface ToolContext {
   client: CarpeClient
@@ -147,6 +147,8 @@ export interface MediaOutputOptions {
   inlineLimit?: number
   /** Remote mode: room reserved in the media store before a one-shot paid call (see reserveOutput). */
   reservation?: Reservation
+  /** Remote mode: the job this output belongs to; it is stored once per user (see storedOutput). */
+  key?: string
 }
 
 /**
@@ -157,7 +159,7 @@ export interface MediaOutputOptions {
 export function reserveOutput(ctx: ToolContext, maxBytes: number, note = 'Nothing was sent or paid.'): Reservation | undefined {
   if (!ctx.media.remote || !ctx.media.store) return undefined
   try {
-    return ctx.media.store.reserve(maxBytes)
+    return ctx.media.store.reserve(maxBytes, ctx.media.owner)
   } catch (err) {
     if (err instanceof LocalRefusal) throw new LocalRefusal(err.code, `${err.message} ${note}`, err.hint)
     throw err
@@ -190,7 +192,7 @@ export async function mediaOutput(
   const kind = media.mime.split('/')[0]
   const inlineLimit = opts.inlineLimit ?? (kind === 'image' ? 4 * MiB : kind === 'audio' ? 8 * MiB : 0)
   const inline = media.bytes.length <= inlineLimit && (kind === 'image' || kind === 'audio')
-  if (ctx.media.remote) return remoteMediaOutput(ctx, media, kind, inline, prefix, opts.reservation)
+  if (ctx.media.remote) return remoteMediaOutput(ctx, media, kind, inline, prefix, opts.reservation, opts.key)
   const path = saveMedia(media, prefix, ctx.media, opts.forceSave || !inline)
   const info: Record<string, unknown> = { mime_type: media.mime, bytes: media.bytes.length, ...(path ? { file: path } : {}), inline }
   const content: CallToolResult['content'] = []
@@ -214,6 +216,7 @@ async function remoteMediaOutput(
   inline: boolean,
   prefix: string,
   reservation: Reservation | undefined,
+  key: string | undefined,
 ): Promise<{ content: CallToolResult['content']; info: Record<string, unknown> }> {
   const info: Record<string, unknown> = { mime_type: media.mime, bytes: media.bytes.length, inline }
   const content: CallToolResult['content'] = []
@@ -232,11 +235,28 @@ async function remoteMediaOutput(
     }
     const store = ctx.media.store
     if (!store) throw new LocalRefusal('MEDIA_NOT_DELIVERED', 'This output is too large to return inline and this server has no temporary storage.')
-    const saved = reservation ? reservation.store(media, prefix) : store.put(media, prefix)
-    Object.assign(info, { url: saved.url, expires_at: saved.expiresAt, expires: 'one hour after creation', storage: 'hosted_mcp' })
-    content.push({ type: 'resource_link', uri: saved.url, name: `${prefix}.${extFor(media.mime)}`, mimeType: media.mime })
+    const saved = reservation ? reservation.store(media, prefix, key) : store.put(media, prefix, { owner: ctx.media.owner, key })
+    return linkOutput(saved, prefix)
   }
   return { content, info }
+}
+
+function linkOutput(saved: StoredMedia, prefix: string): { content: CallToolResult['content']; info: Record<string, unknown> } {
+  return {
+    info: { mime_type: saved.mime, bytes: saved.bytes, inline: false, url: saved.url, expires_at: saved.expiresAt, expires: 'one hour after creation', storage: 'hosted_mcp', ...(saved.existing ? { already_stored: true } : {}) },
+    content: [{ type: 'resource_link', uri: saved.url, name: `${prefix}.${extFor(saved.mime)}`, mimeType: saved.mime }],
+  }
+}
+
+/**
+ * Remote mode: the output of job `key` this user already has in the media
+ * store (the same job polled again), as mediaOutput would return it. Checked
+ * before retrieving, so a finished job is neither fetched nor stored twice.
+ */
+export function storedOutput(ctx: ToolContext, key: string, prefix: string): { content: CallToolResult['content']; info: Record<string, unknown> } | undefined {
+  if (!ctx.media.remote || !ctx.media.store) return undefined
+  const saved = ctx.media.store.find({ owner: ctx.media.owner, key })
+  return saved ? linkOutput(saved, prefix) : undefined
 }
 
 /** POST /v1/image/share → a public, short-lived (about 1 h) URL on the operator. */

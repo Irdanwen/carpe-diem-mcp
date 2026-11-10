@@ -37,6 +37,8 @@ export interface RemoteConfig {
   logSalt: string | undefined
   /** Byte budget of the temporary media store (outputs too large to return inline, and the room held for them). */
   mediaStoreBytes: number
+  /** Each user's share of it (stored + reserved), so one user cannot starve the others. */
+  mediaStorePerUserBytes: number
   /** POST /mcp requests of one user being processed at once (beyond: 429). */
   maxInflightPerUser: number
   /** Request-body bytes being parsed or processed, all users together (beyond: 503). */
@@ -91,6 +93,8 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     logSalt: env.CARPE_MCP_LOG_SALT?.trim() || undefined,
     // At least the largest single output (a 64 MiB video), so any one of them can be kept.
     mediaStoreBytes: int(env, 'CARPE_MCP_MEDIA_STORE_MB', 256, 64) * 1024 * 1024,
+    // The largest output (64 MiB) plus a synchronous call's reservation on top of it.
+    mediaStorePerUserBytes: int(env, 'CARPE_MCP_MEDIA_STORE_PER_USER_MB', 96, 64) * 1024 * 1024,
     maxInflightPerUser: int(env, 'CARPE_MCP_MAX_INFLIGHT_PER_USER', 4, 1),
     // At least one request of the largest size.
     bodyBudgetBytes: int(env, 'CARPE_MCP_BODY_BUDGET_MB', 128, 40) * 1024 * 1024,

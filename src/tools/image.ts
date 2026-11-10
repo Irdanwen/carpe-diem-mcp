@@ -4,7 +4,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { LocalRefusal } from '../errors.js'
 import { decodeBase64Media, loadMedia, sniffMime, toDataUri, type LoadedMedia } from '../media.js'
 import type { Reservation } from '../remote/media-store.js'
-import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, reserveOutput, routeInfo, safe, surfaceOf, undelivered, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
+import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, reserveOutput, routeInfo, safe, storedOutput, surfaceOf, undelivered, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
 import { pollJob } from './jobs.js'
 
 /** Models the operator documents as too slow for the synchronous route (edge cap ~60 s). */
@@ -45,7 +45,7 @@ export function imageTools(ctx: ToolContext): ToolDef[] {
   const finish = async (tool: string, images: LoadedMedia[], urls: string[], structured: Record<string, unknown>, hold?: Reservation, jobId?: string): Promise<CallToolResult> => {
     const outputs: Awaited<ReturnType<typeof mediaOutput>>[] = []
     try {
-      for (const [i, m] of images.entries()) outputs.push(await mediaOutput(ctx, m, `${tool.replace('carpe_', '')}-${i + 1}`, { reservation: hold }))
+      for (const [i, m] of images.entries()) outputs.push(await mediaOutput(ctx, m, `${tool.replace('carpe_', '')}-${i + 1}`, { reservation: hold, key: jobId ? `${jobId}#${i + 1}` : undefined }))
     } catch (err) {
       if (!ctx.media.remote) throw err
       throw undelivered(err, jobId ? `The image of job ${jobId}` : 'The image (already billed)', jobId ? `Nothing is lost: Carpe Diem keeps the finished image for a while. Call carpe_image_status with job_id "${jobId}" again in a few minutes.` : undefined)
@@ -61,6 +61,12 @@ export function imageTools(ctx: ToolContext): ToolDef[] {
   /** Queue on `surface`, wait up to `wait` seconds, return the image or a job id. */
   const queued = async (tool: string, surface: JobSurface, kind: ImageKind, queueId: string, base: Record<string, unknown>, wait: number, extra: ToolExtra, hold?: Reservation): Promise<CallToolResult> => {
     const jobId = encodeJob(surface, 'image', queueId, kind)
+    // Remote mode: already stored for this user (the same job polled again): the same link, no new copy.
+    const stored = storedOutput(ctx, `${jobId}#1`, `${tool.replace('carpe_', '')}-1`)
+    if (stored) {
+      const info = { ...base, status: 'completed', job_id: jobId, images: [stored.info] }
+      return ok(`1 image\n${stored.info.url}\n(temporary link, expires ${stored.info.expires_at})`, info, stored.content)
+    }
     const r = await pollJob(ctx, extra, { path: retrievePath(surface, kind), body: { queue_id: queueId }, auth: surface === 'x402' ? 'none' : 'account', waitSeconds: wait, label: tool })
     if (!r.done) return ok(`Image job queued: ${jobId}. Poll with carpe_image_status.`, { ...base, status: 'pending', job_id: jobId })
     if (r.res) {

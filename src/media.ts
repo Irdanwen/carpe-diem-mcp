@@ -26,6 +26,8 @@ export interface MediaPolicy {
   remote?: boolean
   /** Hosted mode: temporary in-memory storage for outputs too large to return inline. */
   store?: MediaStore
+  /** Hosted mode: the user's hashed `sub`, owner of what this session stores (per-user share, dedupe). */
+  owner?: string
 }
 
 export interface LoadedMedia {

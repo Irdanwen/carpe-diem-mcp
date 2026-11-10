@@ -56,7 +56,7 @@ export function buildRemoteServer(opts: RemoteSessionOptions): RemoteMcp {
     get guard() {
       return opts.guard()
     },
-    media: { allowLocalFiles: false, outputDir: undefined, maxInputBytes: cfg.maxMediaBytes, remote: true, store: opts.store },
+    media: { allowLocalFiles: false, outputDir: undefined, maxInputBytes: cfg.maxMediaBytes, remote: true, store: opts.store, owner: opts.user },
   }
   const tools = buildTools(ctx).filter((t) => !REMOTE_REMOVED_TOOLS.has(t.name))
 

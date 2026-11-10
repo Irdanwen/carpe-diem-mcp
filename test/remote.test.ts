@@ -20,6 +20,7 @@ import { createRemoteApp, type RemoteApp } from '../src/transports/remote.js'
 import { startIssuer, type MintOptions, type TestIssuer } from './helpers/issuer.js'
 import { BIG_MP3, GIANT_PNG, KEY, MP4, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
 import { MediaStore } from '../src/remote/media-store.js'
+import { subHasher } from '../src/remote/log.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const ACCEPT = 'application/json, text/event-stream'
@@ -761,6 +762,87 @@ describe('temporary media store', () => {
     } finally {
       await r.close()
     }
+  })
+
+  test('polling a finished job again returns the same link: the store does not grow, the operator is not asked again', async () => {
+    const r = await startRemote()
+    try {
+      const { client } = await connect(r, await tokenFor(r, { sub: 're-poller' }))
+      const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
+      mock.counters['mus-long'] = 0
+      const m = await call(client, 'carpe_music_generate', { prompt: 'jazz', model: 'long-music', route: 'carpe' })
+      const img = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
+      const first = {
+        video: (await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })).structured.video,
+        music: (await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })).structured.audio,
+      }
+      const size = r.remote.store.size
+      const free = r.remote.store.free
+      const from = mock.calls.length
+      for (let i = 0; i < 5; i++) {
+        const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+        assert.equal(vs.isError, false, vs.text)
+        assert.equal(vs.structured.video.url, first.video.url)
+        assert.equal(vs.structured.video.expires_at, first.video.expires_at)
+        assert.equal(vs.structured.video.already_stored, true)
+        const ms = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+        assert.equal(ms.isError, false, 'the one-shot track is still delivered, not JOB_NOT_FOUND')
+        assert.equal(ms.structured.audio.url, first.music.url)
+        const is = await call(client, 'carpe_image_status', { job_id: img.structured.job_id, wait_seconds: 0 })
+        assert.equal(is.isError, false, is.text)
+        assert.equal(is.structured.images[0].url, img.structured.images[0].url)
+      }
+      assert.equal(r.remote.store.size, size)
+      assert.equal(r.remote.store.free, free)
+      assert.ok(!mock.calls.slice(from).some((c) => /retrieve$/.test(c.path)), 'nothing fetched again')
+      // Another user polling the same job id is not handed this user's link.
+      const other = await connect(r, await tokenFor(r, { sub: 're-poller-2' }))
+      const theirs = await call(other.client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.notEqual(theirs.structured.video?.url, first.video.url)
+      await other.client.close()
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('each user has a share of the store: one user at their share does not block another', async () => {
+    const r = await startRemote({ CARPE_MCP_MEDIA_STORE_MB: '256', CARPE_MCP_MEDIA_STORE_PER_USER_MB: '64' })
+    try {
+      const hash = subHasher('test-salt')
+      const a = await connect(r, await tokenFor(r, { sub: 'share-a' }))
+      const b = await connect(r, await tokenFor(r, { sub: 'share-b' }))
+      r.remote.store.put({ bytes: Buffer.alloc(40 * MiB), mime: 'video/mp4' }, 'filler', { owner: hash('share-a') })
+      const from = mock.calls.length
+      const refused = await call(a.client, 'carpe_tts', { input: 'x', voice: 'long', route: 'carpe' })
+      assert.equal(refused.isError, true)
+      assert.match(refused.text, /MEDIA_STORE_FULL[\s\S]*Your share[\s\S]*Nothing was sent or paid/)
+      assert.ok(!mock.calls.slice(from).some((c) => c.path === '/v1/audio/speech'), 'not paid')
+      const fine = await call(b.client, 'carpe_tts', { input: 'x', voice: 'long', route: 'carpe' })
+      assert.equal(fine.isError, false, fine.text)
+      assert.equal(fine.structured.audio.storage, 'hosted_mcp')
+      for (const c of [a, b]) await c.client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('store: per-owner share (reservations included) and one copy per job', () => {
+    const s = new MediaStore(100, 'https://mcp.example', 1000, () => 0, 50)
+    const hold = s.reserve(30, 'alice')
+    assert.equal(s.freeFor('alice'), 20)
+    assert.equal(s.freeFor('bob'), 50)
+    assert.throws(() => s.reserve(21, 'alice'), (e: any) => e.code === 'MEDIA_STORE_FULL' && /Your share/.test(e.message))
+    const one = hold.store({ bytes: Buffer.alloc(10), mime: 'audio/mpeg' }, 'm', 'job-1')
+    hold.release()
+    assert.equal(s.freeFor('alice'), 40)
+    const again = s.put({ bytes: Buffer.alloc(10), mime: 'audio/mpeg' }, 'm', { owner: 'alice', key: 'job-1' })
+    assert.equal(again.id, one.id)
+    assert.equal(again.existing, true)
+    assert.equal(s.freeFor('alice'), 40, 'no second copy')
+    const bobs = s.put({ bytes: Buffer.alloc(10), mime: 'audio/mpeg' }, 'm', { owner: 'bob', key: 'job-1' })
+    assert.notEqual(bobs.id, one.id, 'keys are per owner')
+    assert.equal(s.find({ owner: 'carol', key: 'job-1' }), undefined)
   })
 
   test('store: TTL, budget and reservations', () => {

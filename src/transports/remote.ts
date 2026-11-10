@@ -123,7 +123,10 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   if (rc.mediaStoreBytes < largestOutput) {
     throw new ConfigError(`CARPE_MCP_MEDIA_STORE_MB must be at least ${Math.ceil(largestOutput / 1048576)} (the largest single output, CARPE_MAX_VIDEO_BYTES / CARPE_MAX_MEDIA_BYTES).`)
   }
-  const store = new MediaStore(rc.mediaStoreBytes, rc.resource)
+  if (rc.mediaStorePerUserBytes < largestOutput) {
+    throw new ConfigError(`CARPE_MCP_MEDIA_STORE_PER_USER_MB must be at least ${Math.ceil(largestOutput / 1048576)} (the largest single output).`)
+  }
+  const store = new MediaStore(rc.mediaStoreBytes, rc.resource, undefined, undefined, Math.min(rc.mediaStorePerUserBytes, rc.mediaStoreBytes))
   // Shared by every user, and harmless: it only reads public prices and quotes, with no credential.
   // Public catalogue reads, shared by the estimator and every session for 60 s (one anonymous operator bucket).
   const publicReads = new PublicReadCache(60_000)
