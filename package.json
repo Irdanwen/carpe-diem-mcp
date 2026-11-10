@@ -1,6 +1,6 @@
 {
   "name": "carpe-diem-mcp",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "mcpName": "io.github.Lumen-labs-ch/carpe-diem-mcp",
   "description": "Model Context Protocol server for Carpe Diem — Venice-grade AI inference (chat, image, video, audio, music, embeddings, web) at marketplace prices, with best-price routing, spend guards and optional x402 pay-per-call on Base.",
   "license": "MIT",
