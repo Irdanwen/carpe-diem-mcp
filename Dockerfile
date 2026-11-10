@@ -14,7 +14,10 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev --no-audit --no-fund
 
 FROM ${NODE_IMAGE}
+# The V8 heap is capped (sessions + parsed bodies, see deploy/README.md "Memory"); deploy/compose.yml
+# sets the same value next to its mem_limit.
 ENV NODE_ENV=production \
+    NODE_OPTIONS=--max-old-space-size=576 \
     CARPE_MCP_REMOTE=1 \
     CARPE_MCP_HOST=0.0.0.0 \
     PORT=3333

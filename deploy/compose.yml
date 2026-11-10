@@ -18,15 +18,17 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    # Memory, with the defaults (measured on 0.2.x, see deploy/README.md "Memory"):
-    #   baseline                                        ~130 MiB
-    #   sessions: 200 (CARPE_MCP_MAX_SESSIONS) × ~0.75  ~150 MiB
-    #   request bodies: 128 MB (CARPE_MCP_BODY_BUDGET_MB), ~107 MiB per 39 MB body in flight → ~320 MiB
-    #   media store: 256 MiB (CARPE_MCP_MEDIA_STORE_MB), outside the V8 heap
-    #   total ~856 MiB, under 1 GiB with ~170 MiB of headroom.
-    # The V8 heap (sessions + parsed bodies, ~430 MiB at most) is capped explicitly; the media store is not in it.
-    # Raising one of the three budgets means raising mem_limit by as much (and the heap for the first two).
-    mem_limit: 1g
+    # Memory (RSS), worst case with the defaults (measured, see deploy/README.md "Memory"):
+    #   baseline                                                         ~125 MiB
+    #   sessions: 200 (CARPE_MCP_MAX_SESSIONS) × ~1.05 MiB                ~210 MiB
+    #   request bodies: 64 MB (CARPE_MCP_BODY_BUDGET_MB) × ~6.7 in flight ~430 MiB
+    #   media store: 256 MiB (CARPE_MCP_MEDIA_STORE_MB), outside the V8 heap,
+    #     ×2 at worst while downloads without Content-Length are joined    ~512 MiB
+    #   total ~1277 MiB, under 1.5 GiB with ~260 MiB of headroom.
+    # The V8 heap (sessions + parsed bodies, ~350 MiB at most) is capped explicitly, with the same value as
+    # the Dockerfile's default; the media store is not in it. Raising a budget means raising mem_limit by
+    # what it costs (bodies: ~6.7 × the MB added; store: ×2) and, for sessions or bodies, the heap too.
+    mem_limit: 1536m
     environment:
       NODE_OPTIONS: --max-old-space-size=576
     pids_limit: 256

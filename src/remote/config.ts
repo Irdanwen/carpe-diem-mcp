@@ -101,7 +101,7 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     ratePerMinute: int(env, 'CARPE_MCP_RATE_PER_MIN', 120, 1),
     rateBurst: int(env, 'CARPE_MCP_RATE_BURST', 30, 1),
     maxSessionsPerUser: int(env, 'CARPE_MCP_MAX_SESSIONS_PER_USER', 5, 1),
-    // About 0.7 MiB of heap per session (an McpServer with its tools): 200 ≈ 150 MiB, see deploy/compose.yml.
+    // About 0.66 MiB of heap, ~1.05 MiB of RSS per session (an McpServer with its tools): 200 ≈ 210 MiB, see deploy/compose.yml.
     maxSessions: int(env, 'CARPE_MCP_MAX_SESSIONS', 200, 1),
     logSalt: env.CARPE_MCP_LOG_SALT?.trim() || undefined,
     // At least the largest single output (a 64 MiB video), so any one of them can be kept.
@@ -109,9 +109,11 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     // The largest output (64 MiB) plus a synchronous call's reservation on top of it.
     mediaStorePerUserBytes: int(env, 'CARPE_MCP_MEDIA_STORE_PER_USER_MB', 96, 64) * 1024 * 1024,
     maxInflightPerUser: int(env, 'CARPE_MCP_MAX_INFLIGHT_PER_USER', 4, 1),
-    // At least one request of the largest size.
-    bodyBudgetBytes: int(env, 'CARPE_MCP_BODY_BUDGET_MB', 128, 40) * 1024 * 1024,
-    // One request of the largest size and a few small ones: it takes three accounts to fill the default budget.
+    // At least one request of the largest size. A body being processed holds ~6.7 times its size in memory
+    // (measured: ~165 MiB RSS for a 25 MiB transcription, ~210 MiB for a 39 MiB video input): 64 MB is
+    // ~430 MiB, what deploy/compose.yml's mem_limit is sized for (deploy/README.md, "Memory").
+    bodyBudgetBytes: int(env, 'CARPE_MCP_BODY_BUDGET_MB', 64, 40) * 1024 * 1024,
+    // One request of the largest size and a few small ones: it takes two accounts to fill the default budget.
     bodyBudgetPerUserBytes: int(env, 'CARPE_MCP_BODY_BUDGET_PER_USER_MB', 48, 40) * 1024 * 1024,
     // 40 MB in 30 s is ~1.4 MB/s: ChatGPT's and Anthropic's servers upload far faster; a stalled upload is cut.
     bodyTimeoutMs: int(env, 'CARPE_MCP_BODY_TIMEOUT_S', 30, 1) * 1000,

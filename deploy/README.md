@@ -90,17 +90,19 @@ Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude
 
 ## Memory
 
-`compose.yml` sets `mem_limit: 1g` and a V8 heap of 576 MiB (`NODE_OPTIONS`). Measured on the application (macOS, Node 22, mock operator; Linux in a container is a little lower):
+`compose.yml` sets `mem_limit: 1536m` and a V8 heap of 576 MiB (`NODE_OPTIONS`, the same value as the `Dockerfile`'s default). Measured with the built CLI under that heap flag, a mock operator that holds each call 3 s so they overlap, and the peak RSS of the process sampled every 50 ms (macOS, Node 24; Linux in a container is a little lower):
 
 | | Default | Measured | Budgeted |
 |---|---|---|---|
-| Baseline (built CLI, idle) | | ~126 MiB RSS | ~130 MiB |
-| Live sessions (`CARPE_MCP_MAX_SESSIONS`) | 200 | ~660 KiB of heap, ~760 KiB RSS each (300 sessions) | ~150 MiB |
-| Request bodies in memory (`CARPE_MCP_BODY_BUDGET_MB`) | 128 MB | 3 × 39 MB bodies admitted out of 8 sent at once: heap +256 MiB, RSS +320 MiB (~107 MiB each) | ~320 MiB |
-| Media store (`CARPE_MCP_MEDIA_STORE_MB`, outside the heap) | 256 MiB | | 256 MiB |
-| **Total** | | | **~856 MiB of 1 GiB** |
+| Baseline (built CLI, idle) | | ~125 MiB RSS | ~125 MiB |
+| Live sessions (`CARPE_MCP_MAX_SESSIONS`) | 200 | 200 sessions: RSS +210 MiB (~1.05 MiB each), ~660 KiB of heap each | ~210 MiB |
+| Request bodies being processed (`CARPE_MCP_BODY_BUDGET_MB`) | 64 MB | `carpe_transcribe` of a 19 MiB file (25.3 MiB body): ~160–167 MiB RSS each, 2 to 4 at once (~195 for the very first call, which also loads code); a 38.7 MiB video input passed through to the operator: ~200–220 MiB each. So ~6.7 × the body size, heap ≤ 3 × | 64 MB × 6.7 ≈ 430 MiB |
+| Media store (`CARPE_MCP_MEDIA_STORE_MB`, outside the heap) | 256 MiB | stored outputs and the room held for downloads in flight; a download read without `Content-Length` is held twice for a moment while its chunks are joined | 2 × 256 = 512 MiB |
+| **Total** | | | **~1277 MiB of 1536** (~260 MiB of headroom) |
 
-Heap at most: ~40 (baseline) + ~130 (sessions) + ~256 (bodies) ≈ 430 MiB, under the 576 MiB cap. Raising one of the budgets means raising `mem_limit` (and, for sessions or bodies, `--max-old-space-size`) by as much.
+Heap at most: ~40 (baseline) + ~130 (sessions) + ~185 (bodies, 3 × 61 MiB) ≈ 355 MiB, under the 576 MiB cap. The value count bounds what a body of small JSON values holds (see the main README, `CARPE_MCP_MAX_JSON_VALUES`: ~6 MiB at the limit, charged to the body budget).
+
+With the previous defaults (128 MB of bodies, `mem_limit: 1g`), four accounts each sending a 19 MiB transcription (100 MB, within the budget) took the process to ~950 MiB RSS with 200 sessions, before any media stored: the container was killed. Raising a budget means raising `mem_limit` by what it costs (bodies: ~6.7 × the MB added; media store: 2 × the MiB added) and, for sessions or bodies, `--max-old-space-size` too (in `compose.yml`).
 
 ## Update and rollback
 

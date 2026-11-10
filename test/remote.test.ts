@@ -754,7 +754,7 @@ describe('rate and memory', () => {
     const d = loadRemoteConfig({})
     assert.equal(d.maxSessions, 200)
     assert.equal(d.maxInflightPerUser, 4)
-    assert.equal(d.bodyBudgetBytes, 128 * 1024 * 1024)
+    assert.equal(d.bodyBudgetBytes, 64 * 1024 * 1024)
     assert.equal(d.bodyBudgetPerUserBytes, 48 * 1024 * 1024)
     assert.equal(d.bodyTimeoutMs, 30_000)
     assert.equal(d.mediaStorePerUserBytes, 96 * 1024 * 1024)

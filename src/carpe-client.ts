@@ -159,18 +159,26 @@ async function readBounded(res: Response, maxBytes: number): Promise<Buffer> {
   }
   if (!res.body) return Buffer.alloc(0)
   const reader = res.body.getReader()
-  const chunks: Buffer[] = []
+  // A declared length is read straight into one buffer (a 64 MiB video is held once, not twice while
+  // its chunks are joined). Without one (or a body longer than declared), chunks are kept as received.
+  const sized = Number.isFinite(declared) && declared > 0 && res.headers.get('content-encoding') === null ? Buffer.allocUnsafe(declared) : undefined
+  const chunks: Uint8Array[] = []
   let total = 0
   for (;;) {
     const { done, value } = await reader.read()
     if (done) break
-    total += value.byteLength
-    if (total > maxBytes) {
+    if (total + value.byteLength > maxBytes) {
       await reader.cancel().catch(() => undefined)
       throw new CarpeError({ status: res.status, code: 'RESPONSE_TOO_LARGE', message: `Response exceeds the ${maxBytes}-byte limit.` })
     }
-    chunks.push(Buffer.from(value))
+    if (sized && !chunks.length && total + value.byteLength <= sized.length) sized.set(value, total)
+    else {
+      if (sized && !chunks.length && total > 0) chunks.push(sized.subarray(0, total))
+      chunks.push(value)
+    }
+    total += value.byteLength
   }
+  if (sized && !chunks.length) return total === sized.length ? sized : sized.subarray(0, total)
   return Buffer.concat(chunks, total)
 }
 
