@@ -147,3 +147,55 @@ test('http transport: loopback only without a token; bearer compared in constant
   assert.ok(!isAuthorized('Bearer nope', 'x'.repeat(16)))
   assert.ok(!isAuthorized(undefined, 'x'.repeat(16)))
 })
+
+test('x402: re-signing counts what the escrow really pulled on-chain, not only what was billed', async () => {
+  const { X402Session } = await import('../src/x402/session.js')
+  const { CarpeResponse } = await import('../src/carpe-client.js')
+  const { generatePrivateKey } = await import('viem/accounts')
+  const cfg = loadConfig({ CARPE_X402_PRIVATE_KEY: generatePrivateKey(), CARPE_X402_BUDGET_USD: '1' })
+  const accept = {
+    scheme: 'carpe-session', network: 'base', maxAmountRequired: '1000',
+    payTo: '0x15917768b31CB1DC61d9d858f2419BF45044005d', asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    extra: { name: 'USD Coin', version: '2' },
+  }
+  const res = (status: number, body: unknown, meta: Record<string, unknown> = {}) =>
+    new CarpeResponse(status, new Headers({ 'content-type': 'application/json' }), Buffer.from(JSON.stringify(body)), { status, ...meta } as never)
+  const value = (h: string) => BigInt(JSON.parse(Buffer.from(h, 'base64').toString()).payload.value)
+
+  // Chain state the fake RPC answers with.
+  let nonce = 0n
+  let allowance = 0n
+  const session = new X402Session(cfg, { stateDir: null, readNonce: async () => nonce, readUsdcBalance: async () => 0n, readAllowance: async () => allowance })
+
+  // First permit: the whole budget. The relay bills $0.01 but the escrow pulls $0.30.
+  const headers: string[] = []
+  let calls = 0
+  const r1 = await session.pay(async (h) => {
+    calls++
+    if (!h) return res(402, { accepts: [accept] })
+    headers.push(h)
+    return res(200, { ok: true }, { costSource: 'x402', costUsd: 0.01 })
+  })
+  assert.equal(r1.status, 200)
+  assert.equal(value(headers[0]!), 1_000_000n)
+  nonce = 1n // permit executed on-chain…
+  allowance = 700_000n // …and $0.30 pulled from it
+
+  // The permit is reported invalid: re-sign. The cap is budget − $0.30, not budget − $0.01.
+  let first = true
+  await session.pay(async (h) => {
+    if (first && h) { first = false; return res(402, { code: 'X402_INVALID', error: 'spent' }) }
+    if (!h) return res(402, { accepts: [accept] })
+    headers.push(h)
+    return res(200, { ok: true }, { costSource: 'x402', costUsd: 0.01 })
+  })
+  assert.equal(value(headers[1]!), 700_000n)
+  assert.equal((await session.status()).billed_usd, 0.31)
+
+  // A permit never executed (nonce unchanged) does not count as spent: re-signing reuses its nonce.
+  const fresh = new X402Session(cfg, { stateDir: null, readNonce: async () => 0n, readUsdcBalance: async () => 0n, readAllowance: async () => 0n })
+  await fresh.sign(accept)
+  const h2 = await fresh.sign(accept)
+  assert.equal(value(h2), 1_000_000n)
+  assert.ok(calls >= 2)
+})
