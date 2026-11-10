@@ -148,7 +148,7 @@ test('http transport: loopback only without a token; bearer compared in constant
   assert.ok(!isAuthorized(undefined, 'x'.repeat(16)))
 })
 
-test('x402: re-signing counts what the escrow really pulled on-chain, not only what was billed', async () => {
+test('x402: re-signing counts what the escrow pulled on-chain and what is still open to it', async () => {
   const { X402Session } = await import('../src/x402/session.js')
   const { CarpeResponse } = await import('../src/carpe-client.js')
   const { generatePrivateKey } = await import('viem/accounts')
@@ -162,16 +162,19 @@ test('x402: re-signing counts what the escrow really pulled on-chain, not only w
     new CarpeResponse(status, new Headers({ 'content-type': 'application/json' }), Buffer.from(JSON.stringify(body)), { status, ...meta } as never)
   const value = (h: string) => BigInt(JSON.parse(Buffer.from(h, 'base64').toString()).payload.value)
 
-  // Chain state the fake RPC answers with.
+  // Chain state the fake RPC answers with (both values are read at one block).
   let nonce = 0n
   let allowance = 0n
-  const session = new X402Session(cfg, { stateDir: null, readNonce: async () => nonce, readUsdcBalance: async () => 0n, readAllowance: async () => allowance })
+  const session = new X402Session(cfg, {
+    stateDir: null,
+    readChainId: async () => 8453,
+    readPermitState: async () => ({ nonce, allowance }),
+    readUsdcBalance: async () => 0n,
+  })
 
   // First permit: the whole budget. The relay bills $0.01 but the escrow pulls $0.30.
   const headers: string[] = []
-  let calls = 0
   const r1 = await session.pay(async (h) => {
-    calls++
     if (!h) return res(402, { accepts: [accept] })
     headers.push(h)
     return res(200, { ok: true }, { costSource: 'x402', costUsd: 0.01 })
@@ -181,21 +184,15 @@ test('x402: re-signing counts what the escrow really pulled on-chain, not only w
   nonce = 1n // permit executed on-chain…
   allowance = 700_000n // …and $0.30 pulled from it
 
-  // The permit is reported invalid: re-sign. The cap is budget − $0.30, not budget − $0.01.
-  let first = true
-  await session.pay(async (h) => {
-    if (first && h) { first = false; return res(402, { code: 'X402_INVALID', error: 'spent' }) }
-    if (!h) return res(402, { accepts: [accept] })
-    headers.push(h)
-    return res(200, { ok: true }, { costSource: 'x402', costUsd: 0.01 })
-  })
-  assert.equal(value(headers[1]!), 700_000n)
-  assert.equal((await session.status()).billed_usd, 0.31)
+  // Reported invalid: re-signing for budget − $0.30 = $0.70 would let the escrow pull the $0.70 still open
+  // first, then $0.70 more (permit() sets the allowance): $1.70 in all. Nothing more can be committed.
+  const resign = (h?: string) => (h ? res(402, { code: 'X402_INVALID', error: 'spent' }) : res(402, { accepts: [accept] }))
+  await assert.rejects(session.pay(async (h) => resign(h)), (e: Error & { code?: string }) => e.code === 'X402_BUDGET_EXHAUSTED' && /still open/.test(e.message))
+  assert.equal((await session.status()).billed_usd, 0.3)
 
-  // A permit never executed (nonce unchanged) does not count as spent: re-signing reuses its nonce.
-  const fresh = new X402Session(cfg, { stateDir: null, readNonce: async () => 0n, readUsdcBalance: async () => 0n, readAllowance: async () => 0n })
-  await fresh.sign(accept)
-  const h2 = await fresh.sign(accept)
-  assert.equal(value(h2), 1_000_000n)
-  assert.ok(calls >= 2)
+  // The relay then drains the $0.70 unbilled: the allowance reads 0, but the permit's whole value counts as pulled.
+  allowance = 0n
+  await assert.rejects(session.pay(async (h) => resign(h)), (e: Error & { code?: string }) => e.code === 'X402_BUDGET_EXHAUSTED')
+  assert.equal((await session.status()).billed_usd, 1)
+  assert.equal(headers.length, 1)
 })

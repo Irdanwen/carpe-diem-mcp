@@ -5,17 +5,27 @@
  * EIP-2612 USDC permit to Carpe's escrow and reuse it on every later request;
  * the operator pulls the actual cost of each request from that allowance.
  *
+ * How the operator settles (operator settle.ts, CarpeEscrow): it pulls from the
+ * allowance already open while that covers the amount (`pullFromUser`), and only
+ * then applies the presented permit (`pullWithPermit`). EIP-2612 `permit()` SETS
+ * the allowance, it does not add to it. So whatever is still open when a new
+ * permit is signed can be pulled on top of that permit's whole value.
+ *
  * Safety properties:
- *   - The permit `value` is the remaining budget (CARPE_X402_BUDGET_USD minus
- *     what was already billed), so the escrow can never pull more than the
- *     budget in total — re-signing never resets the cap. Spend is persisted in
- *     the state directory, so a restart does not reset it either.
- *   - Before re-signing, what the escrow really pulled under the last permit is
- *     read on-chain (its value minus the allowance left), and counted as spent
- *     if it is more than what was billed: a relay that under-reports
- *     X-Payment-Amount-Usdc cannot get the cap reset.
- *   - Before signing, the challenge is checked: known network, USDC asset and
- *     escrow address. A challenge naming anything else is refused.
+ *   - The escrow can never pull more than CARPE_X402_BUDGET_USD in total through
+ *     the permits of this server. Every permit is signed for
+ *       budget − spent − allowance still open to the escrow
+ *     read at the same block as the permit nonce: what is open is committed
+ *     money. Spend is persisted in the state directory, so a restart does not
+ *     reset it.
+ *   - `spent` is what was billed, raised to an on-chain bound when that is
+ *     higher (see applyOnChainFloor): a relay that under-reports
+ *     X-Payment-Amount-Usdc and forces re-signs cannot get the cap reset.
+ *   - An allowance to the escrow that no permit of this server explains (an
+ *     approve() or a permit signed elsewhere) makes the cap impossible to
+ *     guarantee: nothing is signed until it is revoked.
+ *   - Before signing, the challenge is checked (known network, USDC asset,
+ *     escrow address) and so is the RPC's chainId.
  *   - A challenge whose price exceeds the remaining budget is refused locally.
  *   - The private key never leaves this module and is never logged.
  */
@@ -59,10 +69,17 @@ export interface X402Accept {
   extra?: { name?: string; version?: string }
 }
 
+/** The USDC permit nonce of `owner` and its allowance to the escrow, read at one block. */
+export interface PermitState {
+  nonce: bigint
+  allowance: bigint
+}
+
 export interface X402Deps {
-  readNonce?: (asset: Address, owner: Address, chainId: number) => Promise<bigint>
+  /** eth_chainId of the RPC that will be read for `chainId`. */
+  readChainId?: (chainId: number) => Promise<number>
+  readPermitState?: (asset: Address, owner: Address, spender: Address, chainId: number) => Promise<PermitState>
   readUsdcBalance?: (asset: Address, owner: Address, chainId: number) => Promise<bigint>
-  readAllowance?: (asset: Address, owner: Address, spender: Address, chainId: number) => Promise<bigint>
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   stateDir?: string | null
@@ -94,13 +111,26 @@ interface PersistedState {
   header?: string
   permitValueMicros?: string
   signedAt?: number
-  lastPermit?: { value: string; spentBefore: string; nonce: string; asset: string; escrow: string; chainId: number }
+  lastPermit?: {
+    value: string
+    /** Older state files: billed spend only. Superseded by committedBefore. */
+    spentBefore?: string
+    committedBefore?: string
+    allowanceAtSign?: string
+    nonce: string
+    asset: string
+    escrow: string
+    chainId: number
+  }
 }
 
-/** The last permit signed, kept even when its header is dropped (X402_INVALID): re-signing reads what was pulled under it. */
+/** The last permit signed, kept even when its header is dropped: re-signing bounds what was pulled since. */
 interface LastPermit {
   value: bigint
-  spentBefore: bigint
+  /** spent + allowance still open when it was signed: the most pulled or pullable before it applies. */
+  committedBefore: bigint
+  /** The allowance open when it was signed (unknown in older state files). */
+  allowanceAtSign?: bigint
   nonce: bigint
   asset: Address
   escrow: Address
@@ -108,6 +138,7 @@ interface LastPermit {
 }
 
 const usd = (micros: bigint) => Number(micros) / 1e6
+const usdText = (micros: bigint) => (micros >= 2n ** 255n ? 'an unlimited amount of' : `$${usd(micros).toFixed(6)}`)
 
 export class X402Session {
   readonly account: PrivateKeyAccount
@@ -132,12 +163,19 @@ export class X402Session {
       return createPublicClient({ transport: http(cfg.x402RpcUrl) })
     }
     this.deps = {
-      readNonce: deps.readNonce ?? (async (asset, owner, chainId) =>
-        (await rpc(chainId).readContract({ address: asset, abi: ERC20_ABI, functionName: 'nonces', args: [owner] })) as bigint),
+      readChainId: deps.readChainId ?? ((chainId) => rpc(chainId).getChainId()),
+      readPermitState: deps.readPermitState ?? (async (asset, owner, spender, chainId) => {
+        // Both at one block: a nonce one block ahead of the allowance would count a permit as pulled.
+        const client = rpc(chainId)
+        const blockNumber = await client.getBlockNumber({ cacheTime: 0 })
+        const [nonce, allowance] = await Promise.all([
+          client.readContract({ address: asset, abi: ERC20_ABI, functionName: 'nonces', args: [owner], blockNumber }),
+          client.readContract({ address: asset, abi: ERC20_ABI, functionName: 'allowance', args: [owner, spender], blockNumber }),
+        ])
+        return { nonce: nonce as bigint, allowance: allowance as bigint }
+      }),
       readUsdcBalance: deps.readUsdcBalance ?? (async (asset, owner, chainId) =>
         (await rpc(chainId).readContract({ address: asset, abi: ERC20_ABI, functionName: 'balanceOf', args: [owner] })) as bigint),
-      readAllowance: deps.readAllowance ?? (async (asset, owner, spender, chainId) =>
-        (await rpc(chainId).readContract({ address: asset, abi: ERC20_ABI, functionName: 'allowance', args: [owner, spender] })) as bigint),
       now: deps.now ?? Date.now,
       sleep: deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
     }
@@ -165,7 +203,15 @@ export class X402Session {
       this.spentMicros = BigInt(s.spentMicros ?? '0')
       if (s.lastPermit) {
         const p = s.lastPermit
-        this.lastPermit = { value: BigInt(p.value), spentBefore: BigInt(p.spentBefore), nonce: BigInt(p.nonce), asset: getAddress(p.asset), escrow: getAddress(p.escrow), chainId: p.chainId }
+        this.lastPermit = {
+          value: BigInt(p.value),
+          committedBefore: BigInt(p.committedBefore ?? p.spentBefore ?? '0'),
+          allowanceAtSign: p.allowanceAtSign !== undefined ? BigInt(p.allowanceAtSign) : undefined,
+          nonce: BigInt(p.nonce),
+          asset: getAddress(p.asset),
+          escrow: getAddress(p.escrow),
+          chainId: p.chainId,
+        }
       }
       // Only reuse a cached permit if it does not exceed what the current budget allows.
       if (s.header && s.permitValueMicros && BigInt(s.permitValueMicros) <= this.remainingMicros + this.spentMicros) {
@@ -192,7 +238,8 @@ export class X402Session {
           ? {
               lastPermit: {
                 value: this.lastPermit.value.toString(),
-                spentBefore: this.lastPermit.spentBefore.toString(),
+                committedBefore: this.lastPermit.committedBefore.toString(),
+                allowanceAtSign: this.lastPermit.allowanceAtSign?.toString(),
                 nonce: this.lastPermit.nonce.toString(),
                 asset: this.lastPermit.asset,
                 escrow: this.lastPermit.escrow,
@@ -238,45 +285,97 @@ export class X402Session {
     return { ...acc, scheme: CARPE_SESSION_SCHEME }
   }
 
-  /**
-   * Count as spent what the escrow really pulled under the last permit, if it
-   * is more than what was billed. Only once that permit's nonce is consumed:
-   * before that, the on-chain allowance is not its own (and the permit signed
-   * now reuses the same nonce, so at most one of the two can ever execute).
-   * Prudent: a nonce consumed by some other permit of this wallet makes the
-   * allowance look lower than it is, so more counts as spent, never less.
-   */
-  private async applyOnChainFloor(nonce: bigint): Promise<void> {
+  /** The last permit, if it was signed for this asset, escrow and chain (the reads below are about them). */
+  private lastPermitFor(net: NetworkInfo): LastPermit | undefined {
     const p = this.lastPermit
-    if (!p || nonce <= p.nonce) return
-    const left = await this.deps.readAllowance(p.asset, this.account.address, p.escrow, p.chainId)
-    const pulled = p.value - (left < p.value ? left : p.value)
-    const floor = p.spentBefore + pulled
+    return p && p.asset === net.usdc && p.escrow === net.escrow && p.chainId === net.chainId ? p : undefined
+  }
+
+  /**
+   * The most the allowance can be if only this server's permits ever set it.
+   * It only goes down between two permits (pulls), and a permit SETS it. So:
+   * at most the last permit's value once its nonce is consumed, and at most
+   * what was open when it was signed otherwise (that also covers a nonce
+   * consumed by some other permit of this wallet). Undefined when unknown
+   * (older state files).
+   */
+  private ownAllowanceBound(p: LastPermit | undefined, nonce: bigint): bigint | undefined {
+    if (!p) return 0n
+    if (nonce > p.nonce) return p.allowanceAtSign !== undefined && p.allowanceAtSign > p.value ? p.allowanceAtSign : p.value
+    return p.allowanceAtSign
+  }
+
+  /**
+   * Raise `spent` to an upper bound of what the escrow really pulled, when that
+   * is more than what was billed (a relay can under-report
+   * X-Payment-Amount-Usdc). At the last signature, at most `committedBefore`
+   * was pulled or still pullable. Since then, if its nonce was consumed, the
+   * permit may have SET the allowance to its value. So pulled <=
+   * committedBefore (+ value if the nonce moved) - allowance still open.
+   * Counting the live allowance as committed does not make this redundant:
+   * without it, a relay drains the allowance unbilled, the allowance reads 0,
+   * and re-signing would grant a whole new budget.
+   */
+  private applyOnChainFloor(p: LastPermit | undefined, state: PermitState): void {
+    if (!p) return
+    const ceiling = p.committedBefore + (state.nonce > p.nonce ? p.value : 0n)
+    const floor = ceiling > state.allowance ? ceiling - state.allowance : 0n
     if (floor > this.spentMicros) {
       this.spentMicros = floor
       this.save()
     }
   }
 
-  async sign(acc: X402Accept): Promise<string> {
-    const net = this.validateAccept(acc)
-    const owner = this.account.address
-    const nonce = await this.deps.readNonce(net.usdc!, owner, net.chainId)
-    await this.applyOnChainFloor(nonce)
-    const need = BigInt(acc.maxAmountRequired)
-    const remaining = this.remainingMicros
+  private refuseBudget(need: bigint, remaining: bigint, open = 0n): void {
     const minMicros = BigInt(Math.round(X402_MIN_BUDGET_USD * 1e6))
+    const why = open > 0n
+      ? ` (${usdText(open)} is still open as an allowance to the Carpe escrow from an earlier permit: it can still be pulled, so it counts against the budget)`
+      : ''
+    const hint = 'Raise CARPE_X402_BUDGET_USD (it is a cumulative cap) and restart the MCP server.'
     if (need > remaining) {
       throw new LocalRefusal(
         'X402_BUDGET_EXHAUSTED',
-        `This request may cost up to $${usd(need).toFixed(6)} but only $${usd(remaining).toFixed(6)} of the x402 budget is left.`,
-        'Raise CARPE_X402_BUDGET_USD (it is a cumulative cap) and restart the MCP server.',
+        `This request may cost up to $${usd(need).toFixed(6)} but only $${usd(remaining).toFixed(6)} of the x402 budget is left${why}.`,
+        hint,
       )
     }
     if (remaining < minMicros) {
-      throw new LocalRefusal('X402_BUDGET_EXHAUSTED', `Less than the operator minimum of ${X402_MIN_BUDGET_USD} USDC is left in the x402 budget.`, 'Raise CARPE_X402_BUDGET_USD and restart.')
+      throw new LocalRefusal('X402_BUDGET_EXHAUSTED', `Less than the operator minimum of ${X402_MIN_BUDGET_USD} USDC is left in the x402 budget${why}.`, hint)
     }
+  }
+
+  async sign(acc: X402Accept): Promise<string> {
+    const net = this.validateAccept(acc)
+    const owner = this.account.address
+    const need = BigInt(acc.maxAmountRequired)
+    // Decidable without the chain: the on-chain reads below can only lower what is left.
+    this.refuseBudget(need, this.remainingMicros)
+
+    const rpcChainId = await this.deps.readChainId(net.chainId)
+    if (rpcChainId !== net.chainId) {
+      throw new LocalRefusal(
+        'X402_UNEXPECTED_NETWORK',
+        `The x402 challenge is for ${acc.network} (chainId ${net.chainId}) but CARPE_X402_RPC_URL is on chainId ${rpcChainId}. Refusing to sign.`,
+        `Point CARPE_X402_RPC_URL to an RPC for ${acc.network}.`,
+      )
+    }
+    const state = await this.deps.readPermitState(net.usdc!, owner, net.escrow!, net.chainId)
+    const p = this.lastPermitFor(net)
+    const bound = this.ownAllowanceBound(p, state.nonce)
+    if (bound !== undefined && state.allowance > bound) {
+      throw new LocalRefusal(
+        'X402_FOREIGN_ALLOWANCE',
+        `This wallet lets the Carpe escrow (${net.escrow}) pull ${usdText(state.allowance)} USDC through an allowance this server did not grant (an approve() or a permit signed elsewhere). While it exists the x402 budget cap cannot be guaranteed, so nothing is signed.`,
+        `Revoke it: set the USDC allowance of ${owner} to the escrow ${net.escrow} to 0 on ${acc.network} (approve(escrow, 0) from the wallet, or a tool such as revoke.cash), or give this server a wallet of its own. Then retry.`,
+      )
+    }
+    this.applyOnChainFloor(p, state)
+    const committed = this.spentMicros + state.allowance
+    const remaining = this.budgetMicros > committed ? this.budgetMicros - committed : 0n
+    this.refuseBudget(need, remaining, state.allowance)
+
     const value = remaining
+    const nonce = state.nonce
     const deadline = BigInt(Math.floor(this.deps.now() / 1000) + PERMIT_WINDOW_SEC)
     const signature = await this.account.signTypedData({
       domain: { name: acc.extra!.name!, version: acc.extra!.version!, chainId: net.chainId, verifyingContract: net.usdc! },
@@ -296,7 +395,7 @@ export class X402Session {
     this.permitValueMicros = value
     this.signedAt = this.deps.now()
     this.lastAccept = acc
-    this.lastPermit = { value, spentBefore: this.spentMicros, nonce, asset: net.usdc!, escrow: net.escrow!, chainId: net.chainId }
+    this.lastPermit = { value, committedBefore: committed, allowanceAtSign: state.allowance, nonce, asset: net.usdc!, escrow: net.escrow!, chainId: net.chainId }
     this.save()
     return header
   }
@@ -316,7 +415,7 @@ export class X402Session {
     }
   }
 
-  /** Run one paid request: send with the cached permit, answer a challenge once, retry once on a draining balance. */
+  /** Run one paid request: send with the cached permit, re-sign at most once, retry once on a draining balance. */
   async pay(send: (paymentHeader?: string) => Promise<CarpeResponse>): Promise<CarpeResponse> {
     let res = await send(this.header)
     let resigned = false
@@ -330,8 +429,9 @@ export class X402Session {
         res = await send(await this.sign(this.pickAccept(body)))
         continue
       }
-      if (code === 'X402_INVALID' && this.header && !resigned) {
-        // The cached permit is spent, expired, or its nonce was consumed: fetch a fresh challenge.
+      if ((code === 'X402_INVALID' || code === 'X402_PREFLIGHT_FAILED') && this.header && !resigned) {
+        // The cached permit is spent, expired, or its nonce was consumed (the operator's preflight then
+        // simulates a permit that can no longer apply): fetch a fresh challenge, once.
         this.header = undefined
         this.permitValueMicros = undefined
         this.save()
@@ -390,7 +490,7 @@ export class X402Session {
       usdc_balance: usdcBalance ?? null,
       ...(balanceError ? { usdc_balance_error: balanceError } : {}),
       state_file: this.statePath ?? null,
-      note: 'The permit value is the most the Carpe escrow can ever pull from this wallet. Billed amounts come from X-Payment-Amount-Usdc; settlement on-chain is batched.',
+      note: 'The budget is the most the Carpe escrow can ever pull from this wallet through this server: each permit is signed for the budget minus what was spent and what is still open to the escrow. Billed amounts come from X-Payment-Amount-Usdc; settlement on-chain is batched.',
     }
   }
 }

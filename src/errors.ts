@@ -201,7 +201,7 @@ function hintFor(code: string, status: number, details: unknown): string | undef
     case 'X402_UNPAID_BALANCE':
       return 'The wallet owes USDC from earlier x402 requests. Fund the wallet with USDC on Base, wait for the collection, then retry.'
     case 'X402_PREFLIGHT_FAILED':
-      return 'The agent wallet cannot cover this request: send USDC (on Base) to the wallet shown by carpe_x402_status, then retry.'
+      return "The operator's dry run of the USDC pull failed, even after the server fetched a fresh challenge. Check carpe_x402_status: if usdc_balance is below what this request may cost, send USDC (on Base) to that wallet; otherwise the allowance left to the escrow no longer covers it, so raise CARPE_X402_BUDGET_USD and restart the server."
     case 'X402_INVALID':
       return 'The x402 permit was refused (expired, spent, or under the 0.10 USDC minimum). Check carpe_x402_status; restart the server with a new CARPE_X402_BUDGET_USD to sign a fresh permit.'
     case 'BROWSER_KEY_RAIL_REFUSED':
