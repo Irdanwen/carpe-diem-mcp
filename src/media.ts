@@ -16,6 +16,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { randomUUID } from 'node:crypto'
 import { LocalRefusal } from './errors.js'
+import type { MediaStore } from './remote/media-store.js'
 
 export interface MediaPolicy {
   allowLocalFiles: boolean
@@ -23,6 +24,8 @@ export interface MediaPolicy {
   maxInputBytes: number
   /** Hosted mode: https and data: inputs only (redirect hops included), no file output. */
   remote?: boolean
+  /** Hosted mode: temporary in-memory storage for outputs too large to return inline. */
+  store?: MediaStore
 }
 
 export interface LoadedMedia {

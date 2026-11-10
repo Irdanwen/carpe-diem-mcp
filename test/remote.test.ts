@@ -18,7 +18,8 @@ import { loadRemoteConfig } from '../src/remote/config.js'
 import { TokenBucket } from '../src/remote/users.js'
 import { createRemoteApp, type RemoteApp } from '../src/transports/remote.js'
 import { startIssuer, type MintOptions, type TestIssuer } from './helpers/issuer.js'
-import { KEY, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
+import { BIG_MP3, GIANT_PNG, KEY, MP4, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
+import { MediaStore } from '../src/remote/media-store.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const ACCEPT = 'application/json, text/event-stream'
@@ -513,6 +514,170 @@ describe('media without a disk', () => {
     assert.ok(st.content.some((c) => c.type === 'resource_link' && c.uri === `${mock.base}/v1/video/file/abc123`))
     assert.ok(!mock.calls.some((c) => c.path === '/v1/video/file/abc123'), 'the server did not download the video')
     await client.close()
+  })
+})
+
+describe('temporary media store', () => {
+  const MiB = 1024 * 1024
+  const fetchMedia = async (url: string) => {
+    const res = await fetch(url)
+    return { res, body: Buffer.from(await res.arrayBuffer()) }
+  }
+  const waitFor = async (pred: () => boolean) => {
+    for (let i = 0; i < 50 && !pred(); i++) await new Promise((r) => setTimeout(r, 20))
+    return pred()
+  }
+
+  test('outputs too large to return inline (TTS, router/Surplus video, music, queued image) come back as a /media link', async () => {
+    const r = await startRemote()
+    try {
+      const { client } = await connect(r, await tokenFor(r, { sub: 'big-outputs' }))
+      const linkRe = new RegExp(`^${r.url}/media/[A-Za-z0-9_-]{22}$`)
+
+      const tts = await call(client, 'carpe_tts', { input: 'a long text', voice: 'long', route: 'carpe' })
+      assert.equal(tts.isError, false, tts.text)
+      assert.equal(tts.structured.audio.storage, 'hosted_mcp')
+      assert.match(tts.structured.audio.url, linkRe)
+      assert.ok(tts.content.some((c) => c.type === 'resource_link' && c.uri === tts.structured.audio.url))
+      assert.ok(Date.parse(tts.structured.audio.expires_at) - Date.now() > 59 * 60_000)
+      const got = await fetchMedia(tts.structured.audio.url)
+      assert.equal(got.res.status, 200)
+      assert.equal(got.res.headers.get('content-type'), 'audio/mpeg')
+      assert.equal(got.res.headers.get('cache-control'), 'private, no-store')
+      assert.equal(got.res.headers.get('x-content-type-options'), 'nosniff')
+      assert.equal(got.res.headers.get('content-disposition'), 'inline; filename="tts.mp3"')
+      assert.ok(got.body.equals(BIG_MP3))
+
+      // Router video served by Surplus: the operator bills, then sends the MP4 itself.
+      const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
+      assert.equal(v.isError, false, v.text)
+      const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs.isError, false, vs.text)
+      assert.equal(vs.structured.video.storage, 'hosted_mcp')
+      assert.match(vs.text, /Video ready: http/)
+      const vid = await fetchMedia(vs.structured.video.url)
+      assert.equal(vid.res.headers.get('content-type'), 'video/mp4')
+      assert.ok(vid.body.equals(MP4))
+
+      // A Carpe-served track is handed over once: it is kept here.
+      mock.counters['mus-long'] = 0
+      const m = await call(client, 'carpe_music_generate', { prompt: 'jazz', model: 'long-music', route: 'carpe' })
+      assert.equal(m.isError, false, m.text)
+      const ms = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+      assert.equal(ms.isError, false, ms.text)
+      assert.equal(ms.structured.audio.storage, 'hosted_mcp')
+      assert.ok((await fetchMedia(ms.structured.audio.url)).body.equals(BIG_MP3))
+
+      // A queued image above the operator's share limit: stored here, and /complete only after delivery.
+      const from = mock.calls.length
+      const img = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
+      assert.equal(img.isError, false, img.text)
+      assert.equal(img.structured.images[0].storage, 'hosted_mcp')
+      assert.ok((await fetchMedia(img.structured.images[0].url)).body.equals(GIANT_PNG))
+      assert.ok(await waitFor(() => mock.calls.slice(from).some((c) => c.path === '/v1/image/generate/complete')))
+      assert.ok(!mock.calls.slice(from).some((c) => c.path === '/v1/image/share'), 'too large for the operator share: not even tried')
+
+      // Unknown, malformed: 404. The logs never carry a media id.
+      for (const p of ['/media/AAAAAAAAAAAAAAAAAAAAAA', '/media/short', '/media/..%2Fhealth']) {
+        const res = await fetch(`${r.url}${p}`)
+        assert.equal(res.status, 404, p)
+        assert.equal(res.headers.get('cache-control'), 'private, no-store')
+      }
+      const dump = JSON.stringify(r.logs)
+      for (const url of [tts.structured.audio.url, vs.structured.video.url, ms.structured.audio.url, img.structured.images[0].url]) {
+        assert.ok(!dump.includes(url.split('/').pop()), 'a media id reached the logs')
+      }
+      assert.ok(r.logs.some((e) => e.event === 'media' && e.status === 200 && e.bytes === BIG_MP3.length))
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('a full store refuses one-shot paid calls before paying, and a lost delivery is an error naming the job', async () => {
+    const r = await startRemote({ CARPE_MCP_MEDIA_STORE_MB: '64' })
+    try {
+      const { client } = await connect(r, await tokenFor(r, { sub: 'store-full' }))
+      mock.counters['mus-long'] = 0
+      const m = await call(client, 'carpe_music_generate', { prompt: 'jazz', model: 'long-music', route: 'carpe' })
+      const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
+      assert.equal(m.isError || v.isError, false)
+      r.remote.store.put({ bytes: Buffer.alloc(64 * MiB), mime: 'application/octet-stream' }, 'filler')
+      const from = mock.calls.length
+      const sent = (path: string) => mock.calls.slice(from).some((c) => c.path === path)
+
+      const tts = await call(client, 'carpe_tts', { input: 'x', voice: 'long', route: 'carpe' })
+      assert.equal(tts.isError, true)
+      assert.match(tts.text, /MEDIA_STORE_FULL[\s\S]*Nothing was sent or paid/)
+      assert.ok(!sent('/v1/audio/speech'), 'TTS not paid')
+
+      const img = await call(client, 'carpe_image_generate', { prompt: 'a fox', model: 'z-image-turbo', route: 'carpe' })
+      assert.equal(img.isError, true)
+      assert.match(img.text, /MEDIA_STORE_FULL/)
+      assert.ok(!sent('/v1/image/generate'), 'image not paid')
+
+      const ms = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+      assert.equal(ms.isError, true)
+      assert.match(ms.text, /MEDIA_STORE_FULL[\s\S]*nothing is lost/)
+      assert.ok(ms.text.includes(m.structured.job_id))
+      assert.ok(!sent('/v1/audio/music/retrieve'), 'the one-shot track was not fetched')
+
+      const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs.isError, true, 'never isError:false without the video')
+      assert.match(vs.text, /MEDIA_STORE_FULL/)
+      assert.ok(vs.text.includes(v.structured.job_id))
+
+      const gi = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
+      assert.equal(gi.isError, true)
+      const jobId = /job_id "([^"]+)"/.exec(String(gi.structured.error?.hint))?.[1]
+      assert.ok(jobId, gi.text)
+      await new Promise((res) => setTimeout(res, 50))
+      assert.ok(!sent('/v1/image/generate/complete'), 'the operator keeps the undelivered image')
+
+      // Room again: every job is delivered, nothing was lost.
+      r.remote.store.clear()
+      const ms2 = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+      assert.equal(ms2.isError, false, ms2.text)
+      assert.equal(ms2.structured.audio.storage, 'hosted_mcp')
+      const vs2 = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs2.isError, false, vs2.text)
+      const gi2 = await call(client, 'carpe_image_status', { job_id: jobId, wait_seconds: 0 })
+      assert.equal(gi2.isError, false, gi2.text)
+      assert.ok(await waitFor(() => sent('/v1/image/generate/complete')))
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('store: TTL, budget and reservations', () => {
+    let now = 1_000_000
+    const s = new MediaStore(100, 'https://mcp.example', 1000, () => now)
+    const a = s.put({ bytes: Buffer.alloc(40), mime: 'image/png' }, 'a')
+    assert.match(a.url, /^https:\/\/mcp\.example\/media\/[A-Za-z0-9_-]{22}$/)
+    assert.equal(s.free, 60)
+    const hold = s.reserve(50)
+    assert.equal(s.free, 10)
+    assert.throws(() => s.reserve(11), (e: any) => e.code === 'MEDIA_STORE_FULL')
+    assert.throws(() => s.put({ bytes: Buffer.alloc(11), mime: 'image/png' }, 'b'), (e: any) => e.code === 'MEDIA_STORE_FULL')
+    hold.store({ bytes: Buffer.alloc(30), mime: 'audio/mpeg' }, 'c')
+    hold.release()
+    assert.equal(s.free, 30, 'the unused part of the hold is freed')
+    const html = s.put({ bytes: Buffer.from('<script>'), mime: 'text/html' }, 'x')
+    assert.equal(s.get(html.id)!.mime, 'application/octet-stream', 'only image/audio/video types are served as such')
+    now += 1000
+    assert.equal(s.get(a.id), undefined, 'expired')
+    assert.equal(s.free, 100)
+    assert.equal(s.get('../../etc'), undefined)
+  })
+
+  test('the store budget must hold the largest single output', () => {
+    assert.throws(() => loadRemoteConfig({ CARPE_MCP_MEDIA_STORE_MB: '32' }), ConfigError)
+    assert.equal(loadRemoteConfig({}).mediaStoreBytes, 256 * MiB)
+    assert.throws(
+      () => createRemoteApp({ cfg: loadConfig({ CARPE_MCP_REMOTE: '1', CARPE_MAX_VIDEO_BYTES: String(100 * MiB) }), remote: loadRemoteConfig({ CARPE_MCP_MEDIA_STORE_MB: '64' }), log: () => undefined }),
+      /CARPE_MCP_MEDIA_STORE_MB must be at least 100/,
+    )
   })
 })
 

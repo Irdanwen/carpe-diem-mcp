@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import { LocalRefusal } from '../errors.js'
 import { extFor, loadMedia, sniffMime } from '../media.js'
-import { costInfo, mediaOutput, ok, paid, routeInfo, safe, surfaceOf, type ToolContext, type ToolDef } from './context.js'
+import { costInfo, mediaOutput, ok, paid, reserveOutput, routeInfo, safe, surfaceOf, undelivered, type ToolContext, type ToolDef } from './context.js'
 
 const ROUTE_AUDIO = z
   .enum(['carpe', 'router'])
@@ -43,20 +43,33 @@ export function audioTools(ctx: ToolContext): ToolDef[] {
         const body: Record<string, unknown> = { model, input: a.input }
         for (const k of ['voice', 'response_format', 'speed'] as const) if (a[k] !== undefined) body[k] = a[k]
         const estimate = await ctx.estimator.ttsCost(model, String(a.input).length)
-        const res = await paid(ctx, 'carpe_tts', estimate, {
-          method: 'POST',
-          path: surface === 'router' ? '/router/audio/speech' : '/v1/audio/speech',
-          x402Path: '/v1/x402/audio/speech',
-          json: body,
-          auth: 'paid',
-          maxBytes: ctx.cfg.maxMediaBytes,
-          signal: extra.signal,
-        })
-        if (res.isJson) throw new LocalRefusal('UNEXPECTED_RESPONSE', `Expected audio, got JSON: ${res.text().slice(0, 300)}`)
-        const media = { bytes: res.body, mime: sniffMime(res.body) ?? (res.contentType || 'audio/mpeg') }
-        const out = await mediaOutput(ctx, media, 'tts')
-        const structured = { model, audio: out.info, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo(surface, res.meta), ...(notes.length ? { notes } : {}) }
-        return ok(`Speech generated (${media.mime}, ${media.bytes.length} bytes)${out.info.file ? ` — saved to ${out.info.file}` : ''}${out.info.note ? ` — ${out.info.note}` : ''}.\n${JSON.stringify({ cost: structured.cost, route: structured.route })}`, structured, out.content)
+        // Remote mode: the speech is returned once; room to keep it is held before paying.
+        const hold = reserveOutput(ctx, ctx.cfg.maxMediaBytes)
+        try {
+          const res = await paid(ctx, 'carpe_tts', estimate, {
+            method: 'POST',
+            path: surface === 'router' ? '/router/audio/speech' : '/v1/audio/speech',
+            x402Path: '/v1/x402/audio/speech',
+            json: body,
+            auth: 'paid',
+            maxBytes: ctx.cfg.maxMediaBytes,
+            signal: extra.signal,
+          })
+          if (res.isJson) throw new LocalRefusal('UNEXPECTED_RESPONSE', `Expected audio, got JSON: ${res.text().slice(0, 300)}`)
+          const media = { bytes: res.body, mime: sniffMime(res.body) ?? (res.contentType || 'audio/mpeg') }
+          let out: Awaited<ReturnType<typeof mediaOutput>>
+          try {
+            out = await mediaOutput(ctx, media, 'tts', { reservation: hold })
+          } catch (err) {
+            if (ctx.media.remote) throw undelivered(err, 'The speech (already billed)', undefined)
+            throw err
+          }
+          const structured = { model, audio: out.info, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo(surface, res.meta), ...(notes.length ? { notes } : {}) }
+          const where = out.info.file ? ` — saved to ${out.info.file}` : out.info.url ? ` — ${out.info.url} (temporary link, expires ${out.info.expires_at})` : ''
+          return ok(`Speech generated (${media.mime}, ${media.bytes.length} bytes)${where}.\n${JSON.stringify({ cost: structured.cost, route: structured.route })}`, structured, out.content)
+        } finally {
+          hold?.release()
+        }
       }),
     },
     {

@@ -35,6 +35,8 @@ export interface RemoteConfig {
   maxSessions: number
   /** Salt of the hashed user id written to the logs (random per process when unset). */
   logSalt: string | undefined
+  /** Byte budget of the temporary media store (outputs too large to return inline, and the room held for them). */
+  mediaStoreBytes: number
 }
 
 const LOOPBACK = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])$/i
@@ -79,5 +81,7 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     maxSessionsPerUser: int(env, 'CARPE_MCP_MAX_SESSIONS_PER_USER', 5, 1),
     maxSessions: int(env, 'CARPE_MCP_MAX_SESSIONS', 1000, 1),
     logSalt: env.CARPE_MCP_LOG_SALT?.trim() || undefined,
+    // At least the largest single output (a 64 MiB video), so any one of them can be kept.
+    mediaStoreBytes: int(env, 'CARPE_MCP_MEDIA_STORE_MB', 256, 64) * 1024 * 1024,
   }
 }

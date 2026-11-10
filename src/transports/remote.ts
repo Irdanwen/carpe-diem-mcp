@@ -27,7 +27,8 @@ import type { OAuthTokenVerifier } from '@modelcontextprotocol/sdk/server/auth/p
 import type { OAuthProtectedResourceMetadata } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
 import { CarpeClient } from '../carpe-client.js'
-import { loadConfig, type Config } from '../config.js'
+import { ConfigError, loadConfig, type Config } from '../config.js'
+import { MediaStore } from '../remote/media-store.js'
 import { loadRemoteConfig, SUPPORTED_SCOPES, type RemoteConfig } from '../remote/config.js'
 import { safeName, stderrLogger, subHasher, type RemoteLogger } from '../remote/log.js'
 import { REMOTE_REMOVED_TOOLS } from '../remote/policy.js'
@@ -65,6 +66,8 @@ export interface RemoteApp {
   /** Live sessions (tests and health). */
   sessions: Map<string, RemoteSession>
   users: UserRegistry
+  /** Temporary media (tests). */
+  store: MediaStore
   close: () => Promise<void>
 }
 
@@ -116,6 +119,11 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   const allowedOrigins = new Set(opts.allowedOrigins ?? [])
   const sessions = new Map<string, RemoteSession>()
   const users = new UserRegistry(cfg, rc)
+  const largestOutput = Math.max(cfg.maxMediaBytes, cfg.maxVideoBytes, cfg.maxJsonBytes)
+  if (rc.mediaStoreBytes < largestOutput) {
+    throw new ConfigError(`CARPE_MCP_MEDIA_STORE_MB must be at least ${Math.ceil(largestOutput / 1048576)} (the largest single output, CARPE_MAX_VIDEO_BYTES / CARPE_MAX_MEDIA_BYTES).`)
+  }
+  const store = new MediaStore(rc.mediaStoreBytes, rc.resource)
   // Shared by every user, and harmless: it only reads public prices and quotes, with no credential.
   const estimator = new Estimator(new CarpeClient(cfg, undefined, opts.fetchImpl))
   const known = (n: string) => n in TOOL_ANNOTATIONS && !REMOTE_REMOVED_TOOLS.has(n)
@@ -136,6 +144,27 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true })
+  })
+
+  // Temporary media (see remote/media-store.ts): no authentication, the 128-bit id is the capability.
+  // Logged without the id.
+  app.get('/media/:id', (req, res) => {
+    const started = Date.now()
+    const it = store.get(req.params.id)
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Referrer-Policy', 'no-referrer')
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
+    if (!it) {
+      res.status(404).type('text/plain').send('Not found, or expired (temporary links last one hour).')
+    } else {
+      res.status(200)
+      res.setHeader('Content-Type', it.mime)
+      res.setHeader('Content-Length', String(it.bytes.length))
+      res.setHeader('Content-Disposition', `${it.mime === 'application/octet-stream' ? 'attachment' : 'inline'}; filename="${it.filename}"`)
+      res.end(it.bytes)
+    }
+    log({ event: 'media', http: req.method, status: res.statusCode, ...(it ? { bytes: it.bytes.length } : {}), ms: Date.now() - started })
   })
 
   // RFC 9728 metadata: at the root, under the resource path, and under /mcp (where MCP clients look first).
@@ -261,6 +290,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
         user: hashSub(sub),
         log,
         fetchImpl: opts.fetchImpl,
+        store,
       })
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -300,6 +330,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     for (const [id, s] of sessions) if (now - s.lastSeen > SESSION_TTL_MS) closeSession(id)
     users.sweep(now)
     dead.sweep(now)
+    store.sweep(now)
   }, 60_000)
   sweep.unref()
 
@@ -307,9 +338,11 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     app,
     sessions,
     users,
+    store,
     close: async () => {
       clearInterval(sweep)
       for (const id of [...sessions.keys()]) closeSession(id)
+      store.clear()
     },
   }
 }

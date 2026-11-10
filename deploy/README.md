@@ -2,7 +2,7 @@
 
 One container running `carpe-diem-mcp --remote`, behind the host's Nginx, on the VPS that serves the Carpe Diem website. Lot B4 of `docs/CARPE_DIEM_PLAN_mcp-heberge.md` (Carpe-diem- repository).
 
-The server holds no credential and no data: each user's OAuth access token is checked on every request and relayed to the operator, which maps it to that connector's own `cdm_` key. It can be rebuilt and replaced at any time; sessions are in memory, so a restart only makes clients re-initialize.
+The server holds no credential and no durable data: each user's OAuth access token is checked on every request and relayed to the operator, which maps it to that connector's own `cdm_` key. It can be rebuilt and replaced at any time; sessions are in memory, so a restart only makes clients re-initialize. The one thing a restart loses is the temporary media store: outputs too large to return inline, kept in memory for an hour and served at `https://mcp.carpe-diem.xyz/media/<id>` (see the main README, "Paid outputs are never thrown away"). Their links stop working (`404`) after a restart.
 
 ## Prerequisites
 
@@ -49,6 +49,11 @@ curl -s https://mcp.carpe-diem.xyz/.well-known/oauth-protected-resource/mcp | jq
 
 curl -si -X POST https://mcp.carpe-diem.xyz/mcp -H 'content-type: application/json' -d '{}' | grep -i '^www-authenticate'
 # WWW-Authenticate: Bearer error="invalid_token", error_description="Missing Authorization header", resource_metadata="https://mcp.carpe-diem.xyz/.well-known/oauth-protected-resource"
+
+curl -s -o /dev/null -w '%{http_code}\n' https://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
+# 404 (unknown or expired media id)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
+# 403 (GET only)
 ```
 
 Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude.ai connector and a real ChatGPT server on a capped test account).
@@ -57,7 +62,7 @@ Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude
 
 - `https://mcp.carpe-diem.xyz/health` answers `{"ok":true}` and nothing else: add it to the same uptime/Telegram alerting as the website and the operator.
 - The container has a Docker `HEALTHCHECK` and `restart: unless-stopped`.
-- Logs: `docker logs carpe-mcp` (JSON lines: method, tool, status, duration, error code, HMAC of the user id; never prompts, outputs or tokens). Nginx: `/var/log/nginx/mcp.access.log`, without query strings.
+- Logs: `docker logs carpe-mcp` (JSON lines: method, tool, status, duration, error code, HMAC of the user id; never prompts, outputs, tokens or media ids). Nginx: `/var/log/nginx/mcp.access.log`, without query strings, and `/media/<id>` logged as `/media/-` (the id is the capability).
 
 ## Update and rollback
 

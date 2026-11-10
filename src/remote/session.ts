@@ -15,6 +15,7 @@ import type { Estimator, SpendGuard } from '../spend-guard.js'
 import { fail, type ToolContext, type ToolDef, type ToolExtra } from '../tools/context.js'
 import { buildTools } from '../tools/index.js'
 import { safeCode, type RemoteLogger } from './log.js'
+import type { MediaStore } from './media-store.js'
 import { REMOTE_REMOVED_TOOLS, requiredScope } from './policy.js'
 
 export interface RemoteSessionOptions {
@@ -31,6 +32,8 @@ export interface RemoteSessionOptions {
   user: string
   log: RemoteLogger
   fetchImpl?: typeof fetch
+  /** Shared temporary media store (GET /media/<id>). */
+  store?: MediaStore
 }
 
 export interface RemoteMcp {
@@ -51,7 +54,7 @@ export function buildRemoteServer(opts: RemoteSessionOptions): RemoteMcp {
     get guard() {
       return opts.guard()
     },
-    media: { allowLocalFiles: false, outputDir: undefined, maxInputBytes: cfg.maxMediaBytes, remote: true },
+    media: { allowLocalFiles: false, outputDir: undefined, maxInputBytes: cfg.maxMediaBytes, remote: true, store: opts.store },
   }
   const tools = buildTools(ctx).filter((t) => !REMOTE_REMOVED_TOOLS.has(t.name))
 

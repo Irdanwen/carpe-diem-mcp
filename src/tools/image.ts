@@ -1,10 +1,10 @@
 /** Paid image tools. Surfaces differ in paths AND shapes — see the table in README "Two surfaces". */
 import { z } from 'zod'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
-import type { CarpeResponse } from '../carpe-client.js'
 import { LocalRefusal } from '../errors.js'
 import { decodeBase64Media, loadMedia, sniffMime, toDataUri, type LoadedMedia } from '../media.js'
-import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, routeInfo, safe, surfaceOf, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
+import type { Reservation } from '../remote/media-store.js'
+import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, reserveOutput, routeInfo, safe, surfaceOf, undelivered, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
 import { pollJob } from './jobs.js'
 
 /** Models the operator documents as too slow for the synchronous route (edge cap ~60 s). */
@@ -37,31 +37,43 @@ function urlsFromJson(body: unknown): string[] {
 }
 
 export function imageTools(ctx: ToolContext): ToolDef[] {
-  const finish = async (tool: string, _res: CarpeResponse | undefined, images: LoadedMedia[], urls: string[], structured: Record<string, unknown>): Promise<CallToolResult> => {
-    const outputs = await Promise.all(images.map((m, i) => mediaOutput(ctx, m, `${tool.replace('carpe_', '')}-${i + 1}`)))
+  /**
+   * Deliver the images (inline, file, or in remote mode a link). `hold`: room
+   * reserved before a one-shot paid call. `jobId`: the job can be retrieved
+   * again, so a delivery failure names it instead of losing the image.
+   */
+  const finish = async (tool: string, images: LoadedMedia[], urls: string[], structured: Record<string, unknown>, hold?: Reservation, jobId?: string): Promise<CallToolResult> => {
+    const outputs: Awaited<ReturnType<typeof mediaOutput>>[] = []
+    try {
+      for (const [i, m] of images.entries()) outputs.push(await mediaOutput(ctx, m, `${tool.replace('carpe_', '')}-${i + 1}`, { reservation: hold }))
+    } catch (err) {
+      if (!ctx.media.remote) throw err
+      throw undelivered(err, jobId ? `The image of job ${jobId}` : 'The image (already billed)', jobId ? `Nothing is lost: Carpe Diem keeps the finished image for a while. Call carpe_image_status with job_id "${jobId}" again in a few minutes.` : undefined)
+    }
     const content = outputs.flatMap((o) => o.content)
     const info: Record<string, unknown> = { ...structured, images: outputs.map((o) => o.info), ...(urls.length ? { image_urls: urls } : {}) }
     const files = outputs.map((o) => o.info.file).filter(Boolean)
     const links = [...outputs.map((o) => o.info.url).filter(Boolean), ...urls]
-    const notes = outputs.map((o) => o.info.note).filter(Boolean)
-    const lead = `${images.length + urls.length} image(s) from ${structured.model ?? 'the model'}${files.length ? ` — saved to ${files.join(', ')}` : ''}${links.length ? `\n${links.join('\n')}` : ''}${notes.length ? `\n${notes.join('\n')}` : ''}`
+    const lead = `${images.length + urls.length} image(s) from ${structured.model ?? 'the model'}${files.length ? ` — saved to ${files.join(', ')}` : ''}${links.length ? `\n${links.join('\n')}\n(temporary links, about one hour)` : ''}`
     return ok(`${lead}\n${JSON.stringify({ cost: info.cost, route: info.route }, null, 0)}`, info, content)
   }
 
   /** Queue on `surface`, wait up to `wait` seconds, return the image or a job id. */
-  const queued = async (tool: string, surface: JobSurface, kind: ImageKind, queueId: string, base: Record<string, unknown>, wait: number, extra: ToolExtra): Promise<CallToolResult> => {
+  const queued = async (tool: string, surface: JobSurface, kind: ImageKind, queueId: string, base: Record<string, unknown>, wait: number, extra: ToolExtra, hold?: Reservation): Promise<CallToolResult> => {
     const jobId = encodeJob(surface, 'image', queueId, kind)
     const r = await pollJob(ctx, extra, { path: retrievePath(surface, kind), body: { queue_id: queueId }, auth: surface === 'x402' ? 'none' : 'account', waitSeconds: wait, label: tool })
     if (!r.done) return ok(`Image job queued: ${jobId}. Poll with carpe_image_status.`, { ...base, status: 'pending', job_id: jobId })
     if (r.res) {
       const media = { bytes: r.res.body, mime: sniffMime(r.res.body) ?? r.res.contentType }
+      // The retrieve can be repeated until /complete: free the operator buffer only once the image is delivered.
+      const out = await finish(tool, [media], [], { ...base, status: 'completed', job_id: jobId }, hold, jobId)
       if (surface === 'v1') {
-        // Free the operator buffer (best effort; the job also expires on its own).
+        // Best effort; the job also expires on its own.
         ctx.client.request({ method: 'POST', path: `/v1/image/${kind}/complete`, json: { queue_id: queueId }, auth: 'account', retry: 'none' }).catch(() => undefined)
       }
-      return finish(tool, r.res, [media], [], { ...base, status: 'completed', job_id: jobId })
+      return out
     }
-    return finish(tool, undefined, imagesFromJson(r.status), urlsFromJson(r.status), { ...base, status: 'completed', job_id: jobId })
+    return finish(tool, imagesFromJson(r.status), urlsFromJson(r.status), { ...base, status: 'completed', job_id: jobId }, hold, jobId)
   }
 
   const run = async (tool: string, kind: ImageKind, model: string, body: Record<string, unknown>, a: Record<string, any>, extra: ToolExtra, estimate: number | undefined): Promise<CallToolResult> => {
@@ -83,28 +95,35 @@ export function imageTools(ctx: ToolContext): ToolDef[] {
     const wait = a.wait_seconds ?? 120
     const base = { model, kind, ...(notes.length ? { notes } : {}) }
 
-    if (surface === 'router') {
-      const path = kind === 'generate' ? '/router/images/generations' : '/router/images/edits'
-      const res = await paid(ctx, tool, estimate, { method: 'POST', path, json: body, auth: 'paid', signal: extra.signal })
-      const structured = { ...base, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('router', res.meta) }
-      if (!res.isJson) return finish(tool, res, [{ bytes: res.body, mime: sniffMime(res.body) ?? res.contentType }], [], structured)
-      const out = res.json<Record<string, unknown>>()
-      if (typeof out.queue_id === 'string') return queued(tool, 'router', kind, out.queue_id, structured, wait, extra)
-      return finish(tool, res, imagesFromJson(out), urlsFromJson(out), structured)
-    }
-
     const jobSurface: JobSurface = x402 ? 'x402' : 'v1'
-    if (useQueue) {
+    if (surface !== 'router' && useQueue) {
+      // A /v1 job can be retrieved again until /complete: no room needs holding before paying.
       const res = await paid(ctx, tool, estimate, { method: 'POST', path: `/v1/image/${kind}/queue`, x402Path: `/v1/x402/image/${kind}/queue`, json: body, auth: 'paid', signal: extra.signal })
       const out = res.json<{ queue_id?: string }>()
       if (!out.queue_id) throw new LocalRefusal('UNEXPECTED_RESPONSE', `The operator did not return a queue_id: ${JSON.stringify(out).slice(0, 300)}`)
       return queued(tool, jobSurface, kind, out.queue_id, { ...base, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('carpe', res.meta) }, wait, extra)
     }
-    const res = await paid(ctx, tool, estimate, { method: 'POST', path: `/v1/image/${kind}`, x402Path: `/v1/x402/image/${kind}`, json: body, auth: 'paid', signal: extra.signal })
-    const structured = { ...base, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('carpe', res.meta) }
-    if (!res.isJson) return finish(tool, res, [{ bytes: res.body, mime: sniffMime(res.body) ?? res.contentType }], [], structured)
-    const out = res.json<Record<string, unknown>>()
-    return finish(tool, res, imagesFromJson(out), urlsFromJson(out), { ...structured, ...(out.safe_mode !== undefined ? { safe_mode: out.safe_mode } : {}) })
+
+    // Remote mode: a synchronous answer comes once; room for it (the response cap) is held before paying.
+    const hold = reserveOutput(ctx, ctx.cfg.maxJsonBytes)
+    try {
+      if (surface === 'router') {
+        const path = kind === 'generate' ? '/router/images/generations' : '/router/images/edits'
+        const res = await paid(ctx, tool, estimate, { method: 'POST', path, json: body, auth: 'paid', signal: extra.signal })
+        const structured = { ...base, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('router', res.meta) }
+        if (!res.isJson) return await finish(tool, [{ bytes: res.body, mime: sniffMime(res.body) ?? res.contentType }], [], structured, hold)
+        const out = res.json<Record<string, unknown>>()
+        if (typeof out.queue_id === 'string') return await queued(tool, 'router', kind, out.queue_id, structured, wait, extra, hold)
+        return await finish(tool, imagesFromJson(out), urlsFromJson(out), structured, hold)
+      }
+      const res = await paid(ctx, tool, estimate, { method: 'POST', path: `/v1/image/${kind}`, x402Path: `/v1/x402/image/${kind}`, json: body, auth: 'paid', signal: extra.signal })
+      const structured = { ...base, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('carpe', res.meta) }
+      if (!res.isJson) return await finish(tool, [{ bytes: res.body, mime: sniffMime(res.body) ?? res.contentType }], [], structured, hold)
+      const out = res.json<Record<string, unknown>>()
+      return await finish(tool, imagesFromJson(out), urlsFromJson(out), { ...structured, ...(out.safe_mode !== undefined ? { safe_mode: out.safe_mode } : {}) }, hold)
+    } finally {
+      hold?.release()
+    }
   }
 
   const common = {
@@ -212,11 +231,16 @@ export function imageTools(ctx: ToolContext): ToolDef[] {
         // The upscale route wants RAW base64 (no data: prefix), unlike edit.
         const body = { ...(a.extra ?? {}), model, image: img.bytes.toString('base64'), scale: a.scale ?? 2 }
         const estimate = await ctx.estimator.fixedCost(model)
-        const res = await paid(ctx, 'carpe_image_upscale', estimate, { method: 'POST', path: '/v1/image/upscale', x402Path: '/v1/x402/image/upscale', json: body, auth: 'paid', signal: extra.signal })
-        const structured = { model, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('carpe', res.meta) }
-        if (!res.isJson) return finish('carpe_image_upscale', res, [{ bytes: res.body, mime: sniffMime(res.body) ?? res.contentType }], [], structured)
-        const out = res.json<Record<string, unknown>>()
-        return finish('carpe_image_upscale', res, imagesFromJson(out), urlsFromJson(out), structured)
+        const hold = reserveOutput(ctx, ctx.cfg.maxJsonBytes)
+        try {
+          const res = await paid(ctx, 'carpe_image_upscale', estimate, { method: 'POST', path: '/v1/image/upscale', x402Path: '/v1/x402/image/upscale', json: body, auth: 'paid', signal: extra.signal })
+          const structured = { model, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo('carpe', res.meta) }
+          if (!res.isJson) return await finish('carpe_image_upscale', [{ bytes: res.body, mime: sniffMime(res.body) ?? res.contentType }], [], structured, hold)
+          const out = res.json<Record<string, unknown>>()
+          return await finish('carpe_image_upscale', imagesFromJson(out), urlsFromJson(out), structured, hold)
+        } finally {
+          hold?.release()
+        }
       }),
     },
     {

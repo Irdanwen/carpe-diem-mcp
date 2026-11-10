@@ -5,8 +5,9 @@ import type { CallMeta, CarpeClient, CarpeResponse, RequestOptions } from '../ca
 import type { Estimator, SpendGuard } from '../spend-guard.js'
 import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { saveMedia, type LoadedMedia, type MediaPolicy } from '../media.js'
+import { extFor, saveMedia, type LoadedMedia, type MediaPolicy } from '../media.js'
 import { describeError, LocalRefusal } from '../errors.js'
+import type { Reservation } from '../remote/media-store.js'
 
 export interface ToolContext {
   client: CarpeClient
@@ -144,6 +145,36 @@ const SHARE_MAX_BYTES = 10 * MiB
 export interface MediaOutputOptions {
   forceSave?: boolean
   inlineLimit?: number
+  /** Remote mode: room reserved in the media store before a one-shot paid call (see reserveOutput). */
+  reservation?: Reservation
+}
+
+/**
+ * Remote mode: hold room in the media store for the largest output a one-shot
+ * call can return, BEFORE paying for it. Throws MEDIA_STORE_FULL (nothing paid)
+ * when there is none. Undefined outside remote mode.
+ */
+export function reserveOutput(ctx: ToolContext, maxBytes: number, note = 'Nothing was sent or paid.'): Reservation | undefined {
+  if (!ctx.media.remote || !ctx.media.store) return undefined
+  try {
+    return ctx.media.store.reserve(maxBytes)
+  } catch (err) {
+    if (err instanceof LocalRefusal) throw new LocalRefusal(err.code, `${err.message} ${note}`, err.hint)
+    throw err
+  }
+}
+
+/**
+ * Remote mode: a finished, paid output could not be stored. The tool result is
+ * an error naming the job, never a success without the output.
+ */
+export function undelivered(err: unknown, what: string, retry: string | undefined): LocalRefusal {
+  const e = describeError(err)
+  return new LocalRefusal(
+    e.code === 'MEDIA_STORE_FULL' ? 'MEDIA_STORE_FULL' : 'MEDIA_NOT_DELIVERED',
+    `${what} is ready but could not be delivered: ${String(e.message)}`,
+    retry ?? (typeof e.hint === 'string' ? e.hint : undefined),
+  )
 }
 
 /**
@@ -159,7 +190,7 @@ export async function mediaOutput(
   const kind = media.mime.split('/')[0]
   const inlineLimit = opts.inlineLimit ?? (kind === 'image' ? 4 * MiB : kind === 'audio' ? 8 * MiB : 0)
   const inline = media.bytes.length <= inlineLimit && (kind === 'image' || kind === 'audio')
-  if (ctx.media.remote) return remoteMediaOutput(ctx, media, kind, inline)
+  if (ctx.media.remote) return remoteMediaOutput(ctx, media, kind, inline, prefix, opts.reservation)
   const path = saveMedia(media, prefix, ctx.media, opts.forceSave || !inline)
   const info: Record<string, unknown> = { mime_type: media.mime, bytes: media.bytes.length, ...(path ? { file: path } : {}), inline }
   const content: CallToolResult['content'] = []
@@ -169,31 +200,44 @@ export async function mediaOutput(
   return { content, info }
 }
 
-/** Remote mode: there is no disk. Inline, else a short-lived operator share link (images), else a clear note. */
-async function remoteMediaOutput(ctx: ToolContext, media: LoadedMedia, kind: string, inline: boolean): Promise<{ content: CallToolResult['content']; info: Record<string, unknown> }> {
+/**
+ * Remote mode: there is no disk. Inline when small; else an image goes to the
+ * operator's short-lived share link, and anything else (or an image the share
+ * refused) to this server's temporary media store (GET /media/<id>, 1 hour).
+ * Throws when the output cannot be delivered: the caller turns that into an
+ * error naming the job, never a silent success.
+ */
+async function remoteMediaOutput(
+  ctx: ToolContext,
+  media: LoadedMedia,
+  kind: string,
+  inline: boolean,
+  prefix: string,
+  reservation: Reservation | undefined,
+): Promise<{ content: CallToolResult['content']; info: Record<string, unknown> }> {
   const info: Record<string, unknown> = { mime_type: media.mime, bytes: media.bytes.length, inline }
   const content: CallToolResult['content'] = []
   if (inline && kind === 'image') content.push({ type: 'image', data: media.bytes.toString('base64'), mimeType: media.mime })
   else if (inline && kind === 'audio') content.push({ type: 'audio', data: media.bytes.toString('base64'), mimeType: media.mime })
-  else if (kind === 'image' && media.bytes.length <= SHARE_MAX_BYTES) {
-    try {
-      const url = await shareImage(ctx, media)
-      info.url = url
-      info.expires = 'about 1 hour after creation'
-      content.push({ type: 'resource_link', uri: url, name: 'image', mimeType: media.mime })
-    } catch (err) {
-      info.delivered = false
-      info.note = `The image was generated but could not be shared (${describeError(err).code}). It is too large to return inline.`
+  else {
+    if (kind === 'image' && media.bytes.length <= SHARE_MAX_BYTES) {
+      try {
+        const url = await shareImage(ctx, media)
+        Object.assign(info, { url, expires: 'about 1 hour after creation', storage: 'operator_share' })
+        content.push({ type: 'resource_link', uri: url, name: 'image', mimeType: media.mime })
+        return { content, info }
+      } catch {
+        /* the hosted server's own store takes it */
+      }
     }
-  } else {
-    info.delivered = false
-    info.note = REMOTE_TOO_LARGE
+    const store = ctx.media.store
+    if (!store) throw new LocalRefusal('MEDIA_NOT_DELIVERED', 'This output is too large to return inline and this server has no temporary storage.')
+    const saved = reservation ? reservation.store(media, prefix) : store.put(media, prefix)
+    Object.assign(info, { url: saved.url, expires_at: saved.expiresAt, expires: 'one hour after creation', storage: 'hosted_mcp' })
+    content.push({ type: 'resource_link', uri: saved.url, name: `${prefix}.${extFor(media.mime)}`, mimeType: media.mime })
   }
   return { content, info }
 }
-
-export const REMOTE_TOO_LARGE =
-  'Too large to return through the hosted server, and temporary signed storage is not available yet. Use the local server (npx carpe-diem-mcp) for large outputs.'
 
 /** POST /v1/image/share → a public, short-lived (about 1 h) URL on the operator. */
 async function shareImage(ctx: ToolContext, media: LoadedMedia): Promise<string> {

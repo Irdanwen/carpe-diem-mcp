@@ -34,6 +34,10 @@ export interface MockCarpe {
 
 /** A PNG above the 4 MiB inline limit of the hosted server. */
 export const BIG_PNG = Buffer.concat([PNG, Buffer.alloc(5 * 1024 * 1024, 7)])
+/** A PNG above the 10 MiB the operator's /v1/image/share accepts. */
+export const GIANT_PNG = Buffer.concat([PNG, Buffer.alloc(11 * 1024 * 1024, 8)])
+/** Audio above the 8 MiB inline limit of the hosted server. */
+export const BIG_MP3 = Buffer.concat([MP3, Buffer.alloc(9 * 1024 * 1024, 3)])
 
 const challenge = (resource: string, micros: number, override?: Record<string, unknown>) => ({
   x402Version: 1,
@@ -273,9 +277,11 @@ export async function startMockCarpe(): Promise<MockCarpe> {
         return send(res, 200, { id: `img-1-abc.${String(body.mime ?? 'image/png').split('/')[1]}` })
       case 'POST /v1/image/generate/queue':
         if (!needKey()) return
-        return send(res, 202, { queue_id: 'img-q1', status: 'pending' }, cost(900000))
+        return send(res, 202, { queue_id: body.model === 'giant-image' ? 'img-giant' : 'img-q1', status: 'pending' }, cost(900000))
       case 'POST /v1/image/generate/retrieve':
         if (!needKey()) return
+        // Idempotent until /complete, as the operator's image jobs are.
+        if (body.queue_id === 'img-giant') return send(res, 200, GIANT_PNG, { 'content-type': 'image/png', 'x-carpe-image-status': 'completed' })
         if (++imagePolls < 2) return send(res, 200, { status: 'pending', queue_id: body.queue_id })
         return send(res, 200, PNG, { 'content-type': 'image/png', 'x-carpe-image-status': 'completed' })
       case 'POST /v1/image/generate/complete':
@@ -291,7 +297,7 @@ export async function startMockCarpe(): Promise<MockCarpe> {
       case 'POST /router/audio/speech':
         if (!needKey()) return
         if (p.startsWith('/router') && String(body.voice ?? '').startsWith('vv_')) return send(res, 400, { error: 'v1 only', code: 'VOICE_HANDLE_V1_ONLY' })
-        return send(res, 200, MP3, { 'content-type': 'audio/mpeg', ...cost(200) })
+        return send(res, 200, body.voice === 'long' ? BIG_MP3 : MP3, { 'content-type': 'audio/mpeg', ...cost(200) })
 
       case 'POST /v1/video/quote':
         if (!needKey()) return
@@ -315,9 +321,14 @@ export async function startMockCarpe(): Promise<MockCarpe> {
 
       case 'POST /v1/audio/music/queue':
         if (!needKey()) return
-        return send(res, 200, { queue_id: 'mus-1' }, cost(16000))
+        return send(res, 200, { queue_id: body.model === 'long-music' ? 'mus-long' : 'mus-1' }, cost(16000))
       case 'POST /v1/audio/music/retrieve':
         if (!needKey()) return
+        // Handed over once, as the operator does for a Carpe-served track.
+        if (body.queue_id === 'mus-long') {
+          if (bump('mus-long') > 1) return send(res, 404, { error: 'Not found', code: 'JOB_NOT_FOUND' })
+          return send(res, 200, BIG_MP3, { 'content-type': 'audio/mpeg' })
+        }
         if (musicClaimed) return send(res, 404, { error: 'Not found', code: 'JOB_NOT_FOUND' })
         musicClaimed = true
         return send(res, 200, MP3, { 'content-type': 'audio/mpeg' })
