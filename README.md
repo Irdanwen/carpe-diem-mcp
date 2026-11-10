@@ -192,6 +192,8 @@ CARPE_MCP_HOST=127.0.0.1 npx carpe-diem-mcp --remote --port 3333   # behind a TL
 
 `CARPE_MCP_HOST`, `PORT` and `CARPE_MCP_ALLOWED_ORIGINS` apply as in HTTP mode. Run it behind a TLS reverse proxy; http URLs are accepted for the issuer and the resource only on loopback (tests).
 
+Deployment (Docker image, compose file, Nginx vhost, checks, monitoring): [`deploy/README.md`](deploy/README.md).
+
 ## Development
 
 ```bash

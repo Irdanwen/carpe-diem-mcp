@@ -95,7 +95,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     scopes_supported: [...SUPPORTED_SCOPES],
     bearer_methods_supported: ['header'],
     resource_name: 'Carpe Diem',
-    resource_documentation: 'https://github.com/Irdanwen/carpe-diem-mcp#remote-mode-hosted',
+    resource_documentation: 'https://github.com/Lumen-labs-ch/carpe-diem-mcp#remote-mode-hosted',
   }
 
   const app = express()
