@@ -825,6 +825,16 @@ describe('temporary media store', () => {
       assert.equal(got.res.headers.get('x-content-type-options'), 'nosniff')
       assert.equal(got.res.headers.get('content-disposition'), 'inline; filename="tts.mp3"')
       assert.ok(got.body.equals(BIG_MP3))
+      // HEAD: the same status and headers, no body.
+      const head = await fetch(tts.structured.audio.url, { method: 'HEAD' })
+      assert.equal(head.status, 200)
+      for (const h of ['content-type', 'content-length', 'content-disposition', 'cache-control', 'x-content-type-options', 'content-security-policy']) {
+        assert.equal(head.headers.get(h), got.res.headers.get(h), h)
+      }
+      assert.equal(head.headers.get('content-length'), String(BIG_MP3.length))
+      assert.equal((await head.arrayBuffer()).byteLength, 0)
+      assert.equal((await fetch(`${r.url}/media/AAAAAAAAAAAAAAAAAAAAAA`, { method: 'HEAD' })).status, 404)
+      assert.equal((await fetch(tts.structured.audio.url, { method: 'POST' })).status, 404, 'other methods: not served')
 
       // Router video served by Surplus: the operator bills, then sends the MP4 itself.
       const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })

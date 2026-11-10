@@ -38,9 +38,12 @@ RAW="https://raw.githubusercontent.com/$REPO/$MCP_SHA/deploy"
 # 1. Image, built from that commit (never from a working copy; BuildKit, the default builder, fetches a commit directly).
 docker build -t "carpe-diem-mcp:$MCP_VERSION" "https://github.com/$REPO.git#$MCP_SHA"
 
-# 2. Compose AND Nginx files, all from the same commit.
+# 2. Compose AND Nginx files, all from the same commit, downloaded into a temporary directory first.
 mkdir -p /opt/carpe-mcp && cd /opt/carpe-mcp
-for f in compose.yml mcp.env.example nginx-http.conf nginx-mcp.carpe-diem.xyz.conf; do curl -fsSL "$RAW/$f" -o "$f"; done
+NEW=$(mktemp -d /opt/carpe-mcp/.new.XXXXXX)
+trap 'rm -rf "$NEW"' EXIT
+for f in compose.yml mcp.env.example nginx-http.conf nginx-mcp.carpe-diem.xyz.conf; do curl -fsSL "$RAW/$f" -o "$NEW/$f"; done
+mv -f "$NEW"/* .
 if [ ! -e mcp.env ]; then
   install -m 600 mcp.env.example mcp.env
   sed -i "s/^CARPE_MCP_LOG_SALT=.*/CARPE_MCP_LOG_SALT=$(openssl rand -hex 32)/" mcp.env
@@ -52,19 +55,27 @@ docker compose up -d
 for i in $(seq 30); do curl -fsS http://127.0.0.1:3333/health && break; sleep 1; done
 curl -fsS http://127.0.0.1:3333/health                                 # {"ok":true}
 
-# 4. Nginx + certificate. A configuration nginx refuses is removed again, so nginx keeps reloading.
+# 4. Certificate, then Nginx. The vhost is complete (its own port-80 block, the https lines): certbot only
+#    obtains and renews the certificate and never edits it. Its nginx plugin answers the challenge with a
+#    temporary server block of its own; the deploy hook reloads Nginx after each renewal.
+#    A configuration nginx refuses is removed again, so nginx keeps reloading.
 cp nginx-http.conf /etc/nginx/conf.d/carpe-mcp.conf
+if ! nginx -t; then rm -f /etc/nginx/conf.d/carpe-mcp.conf; echo "nginx -t failed on nginx-http.conf"; exit 1; fi
+systemctl reload nginx
+[ -e /etc/letsencrypt/live/mcp.carpe-diem.xyz/fullchain.pem ] ||
+  certbot certonly --nginx -d mcp.carpe-diem.xyz --deploy-hook 'systemctl reload nginx'
 cp nginx-mcp.carpe-diem.xyz.conf /etc/nginx/sites-available/mcp.carpe-diem.xyz
 ln -sf /etc/nginx/sites-available/mcp.carpe-diem.xyz /etc/nginx/sites-enabled/mcp.carpe-diem.xyz
 if ! nginx -t; then
-  rm -f /etc/nginx/sites-enabled/mcp.carpe-diem.xyz /etc/nginx/conf.d/carpe-mcp.conf
+  rm -f /etc/nginx/sites-enabled/mcp.carpe-diem.xyz
   echo "nginx -t failed: the site was not enabled."; exit 1
 fi
 systemctl reload nginx
-certbot --nginx -d mcp.carpe-diem.xyz
 )
 docker inspect --format '{{.State.Health.Status}}' carpe-mcp           # healthy (after ~30 s)
 ```
+
+Do not run `certbot --nginx` (install mode) on this site: it would add its own port-80 block, which logs the whole request line (`/media/<id>` included), next to ours.
 
 ## Checks after install
 
@@ -80,8 +91,15 @@ curl -si -X POST https://mcp.carpe-diem.xyz/mcp -H 'content-type: application/js
 
 curl -s -o /dev/null -w '%{http_code}\n' https://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
 # 404 (unknown or expired media id)
+curl -s -o /dev/null -w '%{http_code}\n' -I https://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
+# 404 (HEAD is allowed: the same status and headers as GET, no body)
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
-# 403 (GET only)
+# 403 (GET and HEAD only)
+
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
+# 301 https://mcp.carpe-diem.xyz/media/AAAAAAAAAAAAAAAAAAAAAA
+tail -n 2 /var/log/nginx/mcp.access.log
+# … "GET /media/- HTTP/1.1" 301 …  (port 80 too: the id is not logged)
 ```
 
 Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude.ai connector and a real ChatGPT server on a capped test account).
@@ -90,7 +108,7 @@ Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude
 
 - `https://mcp.carpe-diem.xyz/health` answers `{"ok":true}` and nothing else: add it to the same uptime/Telegram alerting as the website and the operator.
 - The container has a Docker `HEALTHCHECK` and `restart: unless-stopped`.
-- Logs: `docker logs carpe-mcp` (JSON lines: method, tool, status, duration, error code, HMAC of the user id; never prompts, outputs, tokens or media ids). Nginx: `/var/log/nginx/mcp.access.log`, without query strings, and `/media/<id>` logged as `/media/-` (the id is the capability). `/var/log/nginx/mcp.error.log` (level `warn`) does record the request line, **query string included**, of the requests it reports about (over a rate limit, container unreachable): MCP clients put nothing secret in the URL (the token travels in `Authorization`), and `/media/` logs only at `crit` there. Set `error_log … crit;` in the vhost to keep request lines out of it altogether.
+- Logs: `docker logs carpe-mcp` (JSON lines: method, tool, status, duration, error code, HMAC of the user id; never prompts, outputs, tokens or media ids). Nginx: `/var/log/nginx/mcp.access.log`, without query strings, and `/media/<id>` logged as `/media/-` (the id is the capability), on port 443 and on the port-80 redirect alike (the vhost brings its own port-80 block, logged in the same format). `/var/log/nginx/mcp.error.log` (level `warn`) does record the request line, **query string included**, of the requests it reports about (over a rate limit, container unreachable): MCP clients put nothing secret in the URL (the token travels in `Authorization`), and `/media/` logs only at `crit` there. Set `error_log … crit;` in the vhost to keep request lines out of it altogether.
 
 ## Memory
 
@@ -110,7 +128,7 @@ With the previous defaults (128 MB of bodies, `mem_limit: 1g`), four accounts ea
 
 ## Update and rollback
 
-An update re-syncs the compose file and both Nginx files from the new release's commit, not only the image. `mcp.env` is never overwritten: the new `mcp.env.example` is downloaded next to it and the variable names are compared.
+An update re-syncs the compose file and both Nginx files from the new release's commit, not only the image. Every file is downloaded into a temporary directory first: a download failing halfway leaves the installation as it was. Each file then replaces the old one by a rename (`mv` within one filesystem: never a half-written file). The vhost is complete as published (certbot only renews the certificate), so it is replaced as is. `mcp.env` is never overwritten: the new `mcp.env.example` comes next to it and the variable names are compared. After `docker compose up -d`, the procedure waits for `/health` **and** the container's Docker health; if they do not come, it stops with an error and you roll back (below).
 
 ```bash
 (
@@ -124,34 +142,75 @@ TAG_SHA=$(git ls-remote "https://github.com/$REPO.git" "refs/tags/v$MCP_VERSION"
 [ "$TAG_SHA" = "$MCP_SHA" ] || { echo "v$MCP_VERSION names ${TAG_SHA:-nothing}, not $MCP_SHA: stop."; exit 1; }
 RAW="https://raw.githubusercontent.com/$REPO/$MCP_SHA/deploy"
 
+# 1. Everything fetched first: the image, and the four files into a temporary directory.
 docker build -t "carpe-diem-mcp:$MCP_VERSION" "https://github.com/$REPO.git#$MCP_SHA"
-
-# Previous files kept for a rollback.
-OLD=$(sed -n 's/^MCP_VERSION=//p' .env)
-mkdir -p "previous/$OLD"
-cp compose.yml /etc/nginx/conf.d/carpe-mcp.conf /etc/nginx/sites-available/mcp.carpe-diem.xyz "previous/$OLD/"
-for f in compose.yml mcp.env.example nginx-http.conf nginx-mcp.carpe-diem.xyz.conf; do curl -fsSL "$RAW/$f" -o "$f"; done
+NEW=$(mktemp -d /opt/carpe-mcp/.new.XXXXXX)
+trap 'rm -rf "$NEW"' EXIT
+for f in compose.yml mcp.env.example nginx-http.conf nginx-mcp.carpe-diem.xyz.conf; do curl -fsSL "$RAW/$f" -o "$NEW/$f"; done
 
 # New or removed variables (names only, no values printed): copy what you need into mcp.env by hand.
-diff <(sed -n 's/^#* *\([A-Z][A-Z0-9_]*\)=.*/\1/p' mcp.env | sort -u) <(sed -n 's/^#* *\([A-Z][A-Z0-9_]*\)=.*/\1/p' mcp.env.example | sort -u) || true
+diff <(sed -n 's/^#* *\([A-Z][A-Z0-9_]*\)=.*/\1/p' mcp.env | sort -u) <(sed -n 's/^#* *\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$NEW/mcp.env.example" | sort -u) || true
 
-# Nginx: certbot's lines (listen 443, certificate) live in the vhost, so they are put back after replacing it.
-cp nginx-http.conf /etc/nginx/conf.d/carpe-mcp.conf
-cp nginx-mcp.carpe-diem.xyz.conf /etc/nginx/sites-available/mcp.carpe-diem.xyz
-if ! certbot install --nginx --cert-name mcp.carpe-diem.xyz; then   # runs nginx -t and reloads
+# 2. Previous files kept for a rollback.
+OLD=$(sed -n 's/^MCP_VERSION=//p' .env)
+mkdir -p "previous/$OLD"
+cp compose.yml .env /etc/nginx/conf.d/carpe-mcp.conf /etc/nginx/sites-available/mcp.carpe-diem.xyz "previous/$OLD/"
+
+# 3. Nginx: each file replaced by a rename (the .new names are not loaded by nginx); refused by nginx -t →
+#    the previous files are put back and the container is left as it is.
+cp "$NEW/nginx-http.conf" /etc/nginx/conf.d/carpe-mcp.conf.new
+mv -f /etc/nginx/conf.d/carpe-mcp.conf.new /etc/nginx/conf.d/carpe-mcp.conf
+cp "$NEW/nginx-mcp.carpe-diem.xyz.conf" /etc/nginx/sites-available/mcp.carpe-diem.xyz.new
+mv -f /etc/nginx/sites-available/mcp.carpe-diem.xyz.new /etc/nginx/sites-available/mcp.carpe-diem.xyz
+if ! nginx -t; then
   cp "previous/$OLD/carpe-mcp.conf" /etc/nginx/conf.d/carpe-mcp.conf
   cp "previous/$OLD/mcp.carpe-diem.xyz" /etc/nginx/sites-available/mcp.carpe-diem.xyz
-  cp "previous/$OLD/compose.yml" compose.yml
   nginx -t && systemctl reload nginx
-  echo "Nginx update failed: previous configuration restored, container not updated."; exit 1
+  echo "nginx -t refused the new configuration: previous one restored, container not updated."; exit 1
 fi
+systemctl reload nginx
 
-echo "MCP_VERSION=$MCP_VERSION" > .env
+# 4. Compose file and version (renames), then the container.
+mv -f "$NEW/compose.yml" compose.yml
+mv -f "$NEW/mcp.env.example" mcp.env.example
+echo "MCP_VERSION=$MCP_VERSION" > .env.new && mv -f .env.new .env
 docker compose up -d
+
+# 5. Healthy? /health locally and Docker's own healthcheck (its first run is ~30 s after the start).
+for i in $(seq 60); do
+  if curl -fsS http://127.0.0.1:3333/health >/dev/null 2>&1 &&
+     [ "$(docker inspect --format '{{.State.Health.Status}}' carpe-mcp)" = healthy ]; then
+    curl -fsS https://mcp.carpe-diem.xyz/health && echo && echo "v$MCP_VERSION is up."; exit 0
+  fi
+  sleep 2
+done
+docker compose logs --tail 50 carpe-mcp
+echo "v$MCP_VERSION is not healthy after 2 minutes: roll back to $OLD (next block)."; exit 1
 )
 ```
 
-Rollback: copy `previous/<old version>/compose.yml` back, the two Nginx files back to `/etc/nginx/` (then `nginx -t && systemctl reload nginx`), put the old version in `.env` and `docker compose up -d`. Old images stay until pruned. A restart (update or rollback) empties the temporary media store: its links answer `404` afterwards.
+Rollback (the previous version's files are in `previous/<version>/`, its image is still there until pruned):
+
+```bash
+(
+set -euo pipefail
+cd /opt/carpe-mcp
+OLD=<the version to go back to: a directory under previous/>
+cp "previous/$OLD/carpe-mcp.conf" /etc/nginx/conf.d/carpe-mcp.conf
+cp "previous/$OLD/mcp.carpe-diem.xyz" /etc/nginx/sites-available/mcp.carpe-diem.xyz
+nginx -t && systemctl reload nginx
+cp "previous/$OLD/compose.yml" compose.yml
+cp "previous/$OLD/.env" .env
+docker compose up -d
+for i in $(seq 60); do
+  [ "$(docker inspect --format '{{.State.Health.Status}}' carpe-mcp)" = healthy ] && curl -fsS http://127.0.0.1:3333/health && exit 0
+  sleep 2
+done
+echo "still not healthy: docker compose logs carpe-mcp"; exit 1
+)
+```
+
+A restart (update or rollback) empties the temporary media store: its links answer `404` afterwards.
 
 ## Hardening in place
 

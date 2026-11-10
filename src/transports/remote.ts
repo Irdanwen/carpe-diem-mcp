@@ -161,10 +161,11 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   })
 
   // Temporary media (see remote/media-store.ts): no authentication, the 128-bit id is the capability.
-  // Logged without the id.
-  app.get('/media/:id', (req, res) => {
+  // Logged without the id. GET, and HEAD on purpose (a client checking type and size before downloading):
+  // the same status and headers, Content-Length included, and no body. Other methods: 404 here, 403 at Nginx.
+  const media = (req: Request, res: Response) => {
     const started = Date.now()
-    const it = store.get(req.params.id)
+    const it = store.get(String(req.params.id))
     res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('Referrer-Policy', 'no-referrer')
@@ -176,10 +177,13 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
       res.setHeader('Content-Type', it.mime)
       res.setHeader('Content-Length', String(it.bytes.length))
       res.setHeader('Content-Disposition', `${it.mime === 'application/octet-stream' ? 'attachment' : 'inline'}; filename="${it.filename}"`)
-      res.end(it.bytes)
+      if (req.method === 'HEAD') res.end()
+      else res.end(it.bytes)
     }
-    log({ event: 'media', http: req.method, status: res.statusCode, ...(it ? { bytes: it.bytes.length } : {}), ms: Date.now() - started })
-  })
+    log({ event: 'media', http: req.method, status: res.statusCode, ...(it && req.method !== 'HEAD' ? { bytes: it.bytes.length } : {}), ms: Date.now() - started })
+  }
+  app.head('/media/:id', media)
+  app.get('/media/:id', media)
 
   // RFC 9728 metadata: at the root, under the resource path, and under /mcp (where MCP clients look first).
   const prmPaths = new Set(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp', new URL(prmUrl).pathname])
