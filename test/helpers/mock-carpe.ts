@@ -118,7 +118,9 @@ export async function startMockCarpe(): Promise<MockCarpe> {
     const authed = bearer === KEY || (bearer !== undefined && oauthTokens.has(bearer))
     const needKey = () => {
       if (!authed) {
-        send(res, 401, { error: 'Unauthorized', code: 'AUTH_REQUIRED' })
+        // A relayed OAuth token the operator no longer accepts (revoked connector): 401 INVALID_TOKEN, as B2 answers.
+        if (bearer !== undefined && bearer.split('.').length === 3) send(res, 401, { error: 'This connector was revoked', code: 'INVALID_TOKEN' })
+        else send(res, 401, { error: 'Unauthorized', code: 'AUTH_REQUIRED' })
         return false
       }
       return true

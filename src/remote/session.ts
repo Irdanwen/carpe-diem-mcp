@@ -25,6 +25,8 @@ export interface RemoteSessionOptions {
   guard: () => SpendGuard
   /** The user's current access token. */
   token: () => string | undefined
+  /** The operator refused a relayed token as invalid. */
+  onTokenRejected?: (token: string) => void
   scopes: readonly string[]
   user: string
   log: RemoteLogger
@@ -41,7 +43,7 @@ export interface RemoteMcp {
 
 export function buildRemoteServer(opts: RemoteSessionOptions): RemoteMcp {
   const { cfg } = opts
-  const client = new CarpeClient(cfg, undefined, opts.fetchImpl, opts.token)
+  const client = new CarpeClient(cfg, undefined, opts.fetchImpl, opts.token, opts.onTokenRejected)
   const ctx: ToolContext = {
     client,
     cfg,

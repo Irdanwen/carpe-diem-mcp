@@ -22,7 +22,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js'
 import { metadataHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/metadata.js'
 import { getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js'
-import { InsufficientScopeError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
+import { InsufficientScopeError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import type { OAuthTokenVerifier } from '@modelcontextprotocol/sdk/server/auth/provider.js'
 import type { OAuthProtectedResourceMetadata } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
@@ -34,6 +34,7 @@ import { REMOTE_REMOVED_TOOLS } from '../remote/policy.js'
 import { buildRemoteServer, remoteToolScopes, type RemoteMcp } from '../remote/session.js'
 import { JwtAccessTokenVerifier } from '../remote/token.js'
 import { UserRegistry } from '../remote/users.js'
+import { DeadTokens } from '../remote/dead-tokens.js'
 import { Estimator } from '../spend-guard.js'
 import { TOOL_ANNOTATIONS } from '../tools/annotations.js'
 
@@ -77,7 +78,26 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   const cfg = opts.cfg ?? loadConfig()
   if (!cfg.remote) throw new Error('createRemoteApp needs a remote-mode configuration (CARPE_MCP_REMOTE=1).')
   const rc = opts.remote ?? loadRemoteConfig()
-  const verifier = opts.verifier ?? new JwtAccessTokenVerifier(rc)
+  const signatureVerifier = opts.verifier ?? new JwtAccessTokenVerifier(rc)
+  // A token the operator refused as invalid (connector revoked…) gets 401 here too, so the client signs in again.
+  const dead = new DeadTokens()
+  const verifier: OAuthTokenVerifier = {
+    verifyAccessToken: async (token) => {
+      const info = await signatureVerifier.verifyAccessToken(token)
+      if (dead.has(token)) throw new InvalidTokenError('Token has been revoked')
+      return info
+    },
+  }
+  const onTokenRejected = (token: string) => {
+    let expSec: unknown
+    try {
+      expSec = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8'))?.exp
+    } catch {
+      /* not a JWT: keep it for the longest access-token life */
+    }
+    const untilMs = typeof expSec === 'number' ? (expSec + rc.clockToleranceSec) * 1000 : Date.now() + 3600_000
+    dead.add(token, untilMs)
+  }
   const log = opts.log ?? stderrLogger
   const hashSub = subHasher(rc.logSalt)
   const allowedOrigins = new Set(opts.allowedOrigins ?? [])
@@ -218,6 +238,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
         guard: () => users.guard(sub),
         // Later requests of this session update `token` in place (sessionFor).
         token: () => created.token,
+        onTokenRejected,
         scopes: req.auth!.scopes,
         user: hashSub(sub),
         log,
@@ -260,6 +281,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     const now = Date.now()
     for (const [id, s] of sessions) if (now - s.lastSeen > SESSION_TTL_MS) closeSession(id)
     users.sweep(now)
+    dead.sweep(now)
   }, 60_000)
   sweep.unref()
 

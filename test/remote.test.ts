@@ -294,6 +294,24 @@ describe('credentials and isolation', () => {
     await client.close()
   })
 
+  test('a token the operator refuses as invalid (connector revoked) gets 401 from the MCP server too, so the client signs in again', async () => {
+    const t = await tokenFor(srv, { sub: 'revoked' })
+    const { client } = await connect(srv, t)
+    assert.equal((await call(client, 'carpe_balance')).isError, false)
+    mock.oauthTokens.delete(t) // revoked in API → Keys: the operator now answers 401 INVALID_TOKEN
+    const r = await call(client, 'carpe_balance')
+    assert.equal(r.isError, true)
+    assert.match(r.text, /INVALID_TOKEN/)
+    // From now on the MCP server itself refuses that token, with the challenge that starts the OAuth flow.
+    const again = await rpc(srv, t, INIT)
+    assert.equal(again.status, 401)
+    assert.match(again.headers.get('www-authenticate') ?? '', /invalid_token.*resource_metadata=/)
+    // A free tool would not have told it: only an operator refusal of the token counts. Another user is unaffected.
+    const other = await tokenFor(srv, { sub: 'still-fine' })
+    assert.equal((await rpc(srv, other, INIT)).status, 200)
+    await client.close().catch(() => undefined)
+  })
+
   test('a session id presented with another user\'s token → 403', async () => {
     const a = await tokenFor(srv, { sub: 'alice' })
     const b = await tokenFor(srv, { sub: 'bob' })

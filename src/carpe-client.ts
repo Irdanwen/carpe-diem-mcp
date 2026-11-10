@@ -180,6 +180,19 @@ const MAX_RETRY_WAIT_MS = 10_000
 /** Remote mode: returns the access token of the user this client acts for (undefined = none). */
 export type BearerSource = () => string | undefined
 
+/** Remote mode: told when the operator refuses a relayed token as invalid (401 INVALID_TOKEN). */
+export type TokenRejected = (token: string) => void
+
+/** The `code` of an operator error body, if any (bodies are small: errors are read up to 1 MiB). */
+function errorCodeOf(res: CarpeResponse): string | undefined {
+  try {
+    const code = (JSON.parse(res.text()) as { code?: unknown })?.code
+    return typeof code === 'string' ? code : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export class CarpeClient {
   readonly mode: PaymentMode
   private readonly userAgent: string
@@ -189,6 +202,7 @@ export class CarpeClient {
     private readonly x402: X402Session | undefined = undefined,
     private readonly fetchImpl: FetchLike = fetch,
     private readonly userToken: BearerSource | undefined = undefined,
+    private readonly onTokenRejected: TokenRejected | undefined = undefined,
   ) {
     this.mode = paymentMode(cfg)
     this.userAgent = `${cfg.serverName}/${cfg.serverVersion}`
@@ -290,10 +304,16 @@ export class CarpeClient {
     return url.toString()
   }
 
+  /** The token sent was refused as invalid: remote mode stops accepting it (see remote/dead-tokens.ts). */
+  private noteRejected(res: CarpeResponse, token: string | undefined): void {
+    if (token && this.mode === 'oauth' && res.status === 401 && errorCodeOf(res) === 'INVALID_TOKEN') this.onTokenRejected?.(token)
+  }
+
   private async once(opts: RequestOptions): Promise<CarpeResponse> {
     const headers: Record<string, string> = { 'user-agent': this.userAgent, accept: '*/*' }
     let path = opts.path
     let usingX402 = false
+    let sentToken: string | undefined
 
     if (this.mode === 'oauth') {
       // The user's token goes only to the routes that need an account; public reads stay anonymous.
@@ -301,6 +321,7 @@ export class CarpeClient {
         const token = this.bearer()
         if (!token) throw new LocalRefusal('NOT_AUTHENTICATED', 'No signed-in Carpe Diem account for this request.', 'Reconnect the Carpe Diem connector in your client.')
         headers.authorization = `Bearer ${token}`
+        sentToken = token
       }
     } else if (opts.auth === 'account' || opts.auth === 'optional' || (opts.auth === 'paid' && this.mode === 'api_key')) {
       if (this.cfg.apiKey) headers.authorization = `Bearer ${this.cfg.apiKey}`
@@ -342,7 +363,9 @@ export class CarpeClient {
         throw new CarpeError({ status: res.status, code: 'REDIRECT_REFUSED', message: 'Carpe Diem answered with a redirect; refusing to follow it with credentials.', notExecuted: true })
       }
       const buf = await readBounded(res, res.ok ? opts.maxBytes ?? this.cfg.maxJsonBytes : 1024 * 1024)
-      return new CarpeResponse(res.status, res.headers, buf, parseMeta(res.status, res.headers))
+      const out = new CarpeResponse(res.status, res.headers, buf, parseMeta(res.status, res.headers))
+      this.noteRejected(out, sentToken)
+      return out
     }
 
     if (!usingX402) return send()
@@ -383,7 +406,9 @@ export class CarpeClient {
       const ct = (res.headers.get('content-type') ?? '').toLowerCase()
       if (!res.ok) {
         const buf = await readBounded(res, 1024 * 1024)
-        const err = this.toError(new CarpeResponse(res.status, res.headers, buf, meta))
+        const refused = new CarpeResponse(res.status, res.headers, buf, meta)
+        this.noteRejected(refused, token)
+        const err = this.toError(refused)
         if (attempt < 2 && this.shouldRetry(err, 'paid', opts as RequestOptions)) {
           const wait = err.retryAfterMs ?? 500
           if (wait <= MAX_RETRY_WAIT_MS) {
