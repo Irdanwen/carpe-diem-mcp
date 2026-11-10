@@ -10,6 +10,10 @@
  *     what was already billed), so the escrow can never pull more than the
  *     budget in total — re-signing never resets the cap. Spend is persisted in
  *     the state directory, so a restart does not reset it either.
+ *   - Before re-signing, what the escrow really pulled under the last permit is
+ *     read on-chain (its value minus the allowance left), and counted as spent
+ *     if it is more than what was billed: a relay that under-reports
+ *     X-Payment-Amount-Usdc cannot get the cap reset.
  *   - Before signing, the challenge is checked: known network, USDC asset and
  *     escrow address. A challenge naming anything else is refused.
  *   - A challenge whose price exceeds the remaining budget is refused locally.
@@ -58,6 +62,7 @@ export interface X402Accept {
 export interface X402Deps {
   readNonce?: (asset: Address, owner: Address, chainId: number) => Promise<bigint>
   readUsdcBalance?: (asset: Address, owner: Address, chainId: number) => Promise<bigint>
+  readAllowance?: (asset: Address, owner: Address, spender: Address, chainId: number) => Promise<bigint>
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   stateDir?: string | null
@@ -66,6 +71,7 @@ export interface X402Deps {
 const ERC20_ABI = [
   { type: 'function', name: 'nonces', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'allowance', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }, { name: 'spender', type: 'address' }], outputs: [{ type: 'uint256' }] },
 ] as const
 
 const PERMIT_TYPES = {
@@ -88,6 +94,17 @@ interface PersistedState {
   header?: string
   permitValueMicros?: string
   signedAt?: number
+  lastPermit?: { value: string; spentBefore: string; nonce: string; asset: string; escrow: string; chainId: number }
+}
+
+/** The last permit signed, kept even when its header is dropped (X402_INVALID): re-signing reads what was pulled under it. */
+interface LastPermit {
+  value: bigint
+  spentBefore: bigint
+  nonce: bigint
+  asset: Address
+  escrow: Address
+  chainId: number
 }
 
 const usd = (micros: bigint) => Number(micros) / 1e6
@@ -100,6 +117,7 @@ export class X402Session {
   private permitValueMicros: bigint | undefined
   private signedAt: number | undefined
   private lastAccept: X402Accept | undefined
+  private lastPermit: LastPermit | undefined
   private readonly statePath: string | undefined
   private readonly deps: Required<Omit<X402Deps, 'stateDir'>>
 
@@ -118,6 +136,8 @@ export class X402Session {
         (await rpc(chainId).readContract({ address: asset, abi: ERC20_ABI, functionName: 'nonces', args: [owner] })) as bigint),
       readUsdcBalance: deps.readUsdcBalance ?? (async (asset, owner, chainId) =>
         (await rpc(chainId).readContract({ address: asset, abi: ERC20_ABI, functionName: 'balanceOf', args: [owner] })) as bigint),
+      readAllowance: deps.readAllowance ?? (async (asset, owner, spender, chainId) =>
+        (await rpc(chainId).readContract({ address: asset, abi: ERC20_ABI, functionName: 'allowance', args: [owner, spender] })) as bigint),
       now: deps.now ?? Date.now,
       sleep: deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
     }
@@ -143,6 +163,10 @@ export class X402Session {
       const s = JSON.parse(readFileSync(this.statePath, 'utf8')) as PersistedState
       if (s.address?.toLowerCase() !== this.account.address.toLowerCase()) return
       this.spentMicros = BigInt(s.spentMicros ?? '0')
+      if (s.lastPermit) {
+        const p = s.lastPermit
+        this.lastPermit = { value: BigInt(p.value), spentBefore: BigInt(p.spentBefore), nonce: BigInt(p.nonce), asset: getAddress(p.asset), escrow: getAddress(p.escrow), chainId: p.chainId }
+      }
       // Only reuse a cached permit if it does not exceed what the current budget allows.
       if (s.header && s.permitValueMicros && BigInt(s.permitValueMicros) <= this.remainingMicros + this.spentMicros) {
         this.header = s.header
@@ -164,6 +188,18 @@ export class X402Session {
         header: this.header,
         permitValueMicros: this.permitValueMicros?.toString(),
         signedAt: this.signedAt,
+        ...(this.lastPermit
+          ? {
+              lastPermit: {
+                value: this.lastPermit.value.toString(),
+                spentBefore: this.lastPermit.spentBefore.toString(),
+                nonce: this.lastPermit.nonce.toString(),
+                asset: this.lastPermit.asset,
+                escrow: this.lastPermit.escrow,
+                chainId: this.lastPermit.chainId,
+              },
+            }
+          : {}),
       }
       writeFileSync(this.statePath, JSON.stringify(s, null, 2), { mode: 0o600 })
       chmodSync(this.statePath, 0o600)
@@ -202,8 +238,31 @@ export class X402Session {
     return { ...acc, scheme: CARPE_SESSION_SCHEME }
   }
 
+  /**
+   * Count as spent what the escrow really pulled under the last permit, if it
+   * is more than what was billed. Only once that permit's nonce is consumed:
+   * before that, the on-chain allowance is not its own (and the permit signed
+   * now reuses the same nonce, so at most one of the two can ever execute).
+   * Prudent: a nonce consumed by some other permit of this wallet makes the
+   * allowance look lower than it is, so more counts as spent, never less.
+   */
+  private async applyOnChainFloor(nonce: bigint): Promise<void> {
+    const p = this.lastPermit
+    if (!p || nonce <= p.nonce) return
+    const left = await this.deps.readAllowance(p.asset, this.account.address, p.escrow, p.chainId)
+    const pulled = p.value - (left < p.value ? left : p.value)
+    const floor = p.spentBefore + pulled
+    if (floor > this.spentMicros) {
+      this.spentMicros = floor
+      this.save()
+    }
+  }
+
   async sign(acc: X402Accept): Promise<string> {
     const net = this.validateAccept(acc)
+    const owner = this.account.address
+    const nonce = await this.deps.readNonce(net.usdc!, owner, net.chainId)
+    await this.applyOnChainFloor(nonce)
     const need = BigInt(acc.maxAmountRequired)
     const remaining = this.remainingMicros
     const minMicros = BigInt(Math.round(X402_MIN_BUDGET_USD * 1e6))
@@ -218,8 +277,6 @@ export class X402Session {
       throw new LocalRefusal('X402_BUDGET_EXHAUSTED', `Less than the operator minimum of ${X402_MIN_BUDGET_USD} USDC is left in the x402 budget.`, 'Raise CARPE_X402_BUDGET_USD and restart.')
     }
     const value = remaining
-    const owner = this.account.address
-    const nonce = await this.deps.readNonce(net.usdc!, owner, net.chainId)
     const deadline = BigInt(Math.floor(this.deps.now() / 1000) + PERMIT_WINDOW_SEC)
     const signature = await this.account.signTypedData({
       domain: { name: acc.extra!.name!, version: acc.extra!.version!, chainId: net.chainId, verifyingContract: net.usdc! },
@@ -239,6 +296,7 @@ export class X402Session {
     this.permitValueMicros = value
     this.signedAt = this.deps.now()
     this.lastAccept = acc
+    this.lastPermit = { value, spentBefore: this.spentMicros, nonce, asset: net.usdc!, escrow: net.escrow!, chainId: net.chainId }
     this.save()
     return header
   }

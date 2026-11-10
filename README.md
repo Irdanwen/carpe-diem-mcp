@@ -97,7 +97,7 @@ Each result includes `route: { surface, endpoint_prefix, route_used, tee, reason
 | Mode | Set | What happens |
 |---|---|---|
 | **API key** (recommended) | `CARPE_API_KEY=cdm_…` | Billed to your Carpe account (credits or prepaid rail). Account tools work. |
-| **x402** (no account) | `CARPE_X402_PRIVATE_KEY=0x…` + `CARPE_X402_BUDGET_USD=2` | Pays per request in USDC on Base with the `carpe-session` scheme: **one** EIP-2612 permit to the Carpe escrow, reused for every call. The permit value is the remaining budget, so **the escrow can never pull more than `CARPE_X402_BUDGET_USD` in total** — re-signing never resets the cap, and spend is persisted in `~/.carpe-mcp/` across restarts. Before signing, the challenge's network, USDC address and escrow are checked against pinned values. |
+| **x402** (no account) | `CARPE_X402_PRIVATE_KEY=0x…` + `CARPE_X402_BUDGET_USD=2` | Pays per request in USDC on Base with the `carpe-session` scheme: **one** EIP-2612 permit to the Carpe escrow, reused for every call. The permit value is the remaining budget, so **the escrow can never pull more than `CARPE_X402_BUDGET_USD` in total** — re-signing never resets the cap (before re-signing, what the escrow really pulled under the last permit is read on-chain and counted if it exceeds what was billed), and spend is persisted in `~/.carpe-mcp/` across restarts. Before signing, the challenge's network, USDC address and escrow are checked against pinned values. |
 
 The API key wins when both are set. Without either, free tools still work (catalogue, prices, quotes, markets, status).
 
@@ -135,7 +135,7 @@ Media inputs accept an `https://` URL, a `data:` URI, or (stdio only) a local pa
 |---|---|---|
 | `CARPE_API_KEY` | — | `cdm_…` key |
 | `CARPE_X402_PRIVATE_KEY` / `CARPE_X402_BUDGET_USD` | — | x402 mode (budget ≥ 0.10, required with the key) |
-| `CARPE_X402_RPC_URL` | `https://mainnet.base.org` | Reads the USDC permit nonce and balance |
+| `CARPE_X402_RPC_URL` | `https://mainnet.base.org` | Reads the USDC permit nonce, balance and allowance to the escrow |
 | `CARPE_MAX_SPEND_USD` / `CARPE_MAX_PER_CALL_USD` | `5` / `0.50` | Spend guard (`0` = off) |
 | `CARPE_DEFAULT_ROUTE` | `carpe` | `carpe` (`/v1`) or `router` (`/router`) |
 | `CARPE_DEFAULT_CHAT_MODEL` | `deepseek-v4-flash` | |
