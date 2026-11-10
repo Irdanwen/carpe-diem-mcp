@@ -1,16 +1,16 @@
 {
   "name": "carpe-diem-mcp",
   "version": "0.1.1",
-  "mcpName": "io.github.Irdanwen/carpe-diem-mcp",
+  "mcpName": "io.github.Lumen-labs-ch/carpe-diem-mcp",
   "description": "Model Context Protocol server for Carpe Diem — Venice-grade AI inference (chat, image, video, audio, music, embeddings, web) at marketplace prices, with best-price routing, spend guards and optional x402 pay-per-call on Base.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Irdanwen/carpe-diem-mcp.git"
+    "url": "git+https://github.com/Lumen-labs-ch/carpe-diem-mcp.git"
   },
-  "homepage": "https://github.com/Irdanwen/carpe-diem-mcp#readme",
+  "homepage": "https://github.com/Lumen-labs-ch/carpe-diem-mcp#readme",
   "bugs": {
-    "url": "https://github.com/Irdanwen/carpe-diem-mcp/issues"
+    "url": "https://github.com/Lumen-labs-ch/carpe-diem-mcp/issues"
   },
   "type": "module",
   "main": "./dist/server.js",
