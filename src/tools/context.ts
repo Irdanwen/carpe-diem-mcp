@@ -137,16 +137,29 @@ export function decodeJob(handle: string, kind: string): { surface: JobSurface; 
   return { surface: surface as JobSurface, queueId, model: model || undefined }
 }
 
-/** Turn produced media into MCP content: inline when small enough, else (or also) a file. */
-export function mediaOutput(
+const MiB = 1024 * 1024
+/** The operator's /v1/image/share refuses larger images. */
+const SHARE_MAX_BYTES = 10 * MiB
+
+export interface MediaOutputOptions {
+  forceSave?: boolean
+  inlineLimit?: number
+}
+
+/**
+ * Turn produced media into MCP content: inline when small enough, else (or also) a file.
+ * Remote mode writes nothing to disk: inline when small, else a link (see remoteMediaOutput).
+ */
+export async function mediaOutput(
   ctx: ToolContext,
   media: LoadedMedia,
   prefix: string,
-  opts: { forceSave?: boolean; inlineLimit?: number } = {},
-): { content: CallToolResult['content']; info: Record<string, unknown> } {
+  opts: MediaOutputOptions = {},
+): Promise<{ content: CallToolResult['content']; info: Record<string, unknown> }> {
   const kind = media.mime.split('/')[0]
-  const inlineLimit = opts.inlineLimit ?? (kind === 'image' ? 4 * 1024 * 1024 : kind === 'audio' ? 8 * 1024 * 1024 : 0)
+  const inlineLimit = opts.inlineLimit ?? (kind === 'image' ? 4 * MiB : kind === 'audio' ? 8 * MiB : 0)
   const inline = media.bytes.length <= inlineLimit && (kind === 'image' || kind === 'audio')
+  if (ctx.media.remote) return remoteMediaOutput(ctx, media, kind, inline)
   const path = saveMedia(media, prefix, ctx.media, opts.forceSave || !inline)
   const info: Record<string, unknown> = { mime_type: media.mime, bytes: media.bytes.length, ...(path ? { file: path } : {}), inline }
   const content: CallToolResult['content'] = []
@@ -154,6 +167,41 @@ export function mediaOutput(
   if (inline && kind === 'audio') content.push({ type: 'audio', data: media.bytes.toString('base64'), mimeType: media.mime })
   if (path) content.push({ type: 'resource_link', uri: pathToFileURL(path).href, name: basename(path), mimeType: media.mime })
   return { content, info }
+}
+
+/** Remote mode: there is no disk. Inline, else a short-lived operator share link (images), else a clear note. */
+async function remoteMediaOutput(ctx: ToolContext, media: LoadedMedia, kind: string, inline: boolean): Promise<{ content: CallToolResult['content']; info: Record<string, unknown> }> {
+  const info: Record<string, unknown> = { mime_type: media.mime, bytes: media.bytes.length, inline }
+  const content: CallToolResult['content'] = []
+  if (inline && kind === 'image') content.push({ type: 'image', data: media.bytes.toString('base64'), mimeType: media.mime })
+  else if (inline && kind === 'audio') content.push({ type: 'audio', data: media.bytes.toString('base64'), mimeType: media.mime })
+  else if (kind === 'image' && media.bytes.length <= SHARE_MAX_BYTES) {
+    try {
+      const url = await shareImage(ctx, media)
+      info.url = url
+      info.expires = 'about 1 hour after creation'
+      content.push({ type: 'resource_link', uri: url, name: 'image', mimeType: media.mime })
+    } catch (err) {
+      info.delivered = false
+      info.note = `The image was generated but could not be shared (${describeError(err).code}). It is too large to return inline.`
+    }
+  } else {
+    info.delivered = false
+    info.note = REMOTE_TOO_LARGE
+  }
+  return { content, info }
+}
+
+export const REMOTE_TOO_LARGE =
+  'Too large to return through the hosted server, and temporary signed storage is not available yet. Use the local server (npx carpe-diem-mcp) for large outputs.'
+
+/** POST /v1/image/share → a public, short-lived (about 1 h) URL on the operator. */
+async function shareImage(ctx: ToolContext, media: LoadedMedia): Promise<string> {
+  const res = await ctx.client.request({ method: 'POST', path: '/v1/image/share', json: { data: media.bytes.toString('base64'), mime: media.mime }, auth: 'account', retry: 'none' })
+  const out = res.json<{ id?: unknown; url?: unknown }>()
+  if (typeof out.url === 'string' && /^https:\/\//i.test(out.url)) return out.url
+  if (typeof out.id === 'string' && /^[A-Za-z0-9._-]{1,200}$/.test(out.id)) return ctx.client.absoluteUrl(`/v1/image/share/${out.id}`)
+  throw new LocalRefusal('UNEXPECTED_RESPONSE', 'The operator did not return a share id.')
 }
 
 export async function progress(extra: ToolExtra, value: number, total: number | undefined, message: string): Promise<void> {

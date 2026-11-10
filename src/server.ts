@@ -1,7 +1,7 @@
 /**
  * Build a configured MCP server. Pure factory: transports live in src/transports/.
  */
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { CarpeClient } from './carpe-client.js'
 import { loadConfig, paymentMode, type Config } from './config.js'
 import { buildPrompts } from './prompts.js'
@@ -32,6 +32,15 @@ export interface BuiltServer {
 
 export function instructions(cfg: Config): string {
   const mode = paymentMode(cfg)
+  if (mode === 'oauth') {
+    return [
+      'Carpe Diem MCP (hosted): Venice AI models (text, image, video, audio, music, embeddings, web search) bought on the Carpe Diem marketplace, usually below Venice list prices.',
+      'Two API surfaces, chosen per call with route: "carpe" = /v1, served only by Carpe inside its TEE (private); "router" = /router, the cheapest market, which may be outside a TEE (each result says route_used and tee).',
+      'Use carpe_quote before expensive text calls, carpe_model_details for model constraints, carpe_balance for funds. Results report the exact cost billed.',
+      `Payment: the signed-in Carpe Diem account, through this connector's own key and within the daily cap chosen when connecting. Per-call guard: max $${cfg.maxPerCallUsd} (0 = no limit).`,
+      'Media inputs: https:// URLs or data: URIs only. Large outputs come back as short-lived links.',
+    ].join(' ')
+  }
   return [
     'Carpe Diem MCP: Venice AI models (text, image, video, audio, music, embeddings, web search) bought on the Carpe Diem marketplace, usually below Venice list prices.',
     'Two API surfaces, chosen per call with route: "carpe" = /v1, served only by Carpe inside its TEE (private); "router" = /router, the cheapest market, which may be outside a TEE (each result says route_used and tee).',
@@ -64,24 +73,39 @@ export function buildServer(opts: BuildOptions = {}): BuiltServer {
     estimator,
     media: { allowLocalFiles: opts.allowLocalFiles ?? true, outputDir: cfg.outputDir, maxInputBytes: cfg.maxMediaBytes },
   })
+  const { server } = createMcpServer(cfg, tools, client)
+  return { server, client, guard, tools }
+}
 
+/** Register tools, resources and prompts on a new McpServer. `wrap` decorates every tool handler (remote mode). */
+export function createMcpServer(
+  cfg: Config,
+  tools: ToolDef[],
+  client: CarpeClient,
+  wrap: (t: ToolDef) => ToolDef['handler'] = (t) => t.handler,
+): { server: McpServer; registered: Map<string, RegisteredTool> } {
   const server = new McpServer(
     { name: cfg.serverName, version: cfg.serverVersion },
     { capabilities: { tools: {}, resources: {}, prompts: {}, logging: {} }, instructions: instructions(cfg) },
   )
   // Cast: avoid the SDK's deep ZodRawShape inference; zod still validates at runtime.
   const srv = server as unknown as {
-    registerTool: (name: string, def: unknown, handler: unknown) => void
+    registerTool: (name: string, def: unknown, handler: unknown) => RegisteredTool
     registerResource: (name: string, uri: string, def: unknown, handler: unknown) => void
     registerPrompt: (name: string, def: unknown, handler: unknown) => void
   }
+  const registered = new Map<string, RegisteredTool>()
   for (const t of tools) {
     const annotations = TOOL_ANNOTATIONS[t.name]
     if (!annotations) throw new Error(`Tool ${t.name} has no annotations`)
-    srv.registerTool(
+    const handler = wrap(t)
+    registered.set(
       t.name,
-      { title: t.title, description: t.description, inputSchema: t.inputSchema, annotations: { title: t.title, ...annotations } },
-      async (args: unknown, extra: unknown) => t.handler(args, extra as never),
+      srv.registerTool(
+        t.name,
+        { title: t.title, description: t.description, inputSchema: t.inputSchema, annotations: { title: t.title, ...annotations } },
+        async (args: unknown, extra: unknown) => handler(args, extra as never),
+      ),
     )
   }
   for (const r of buildResources(client)) {
@@ -90,7 +114,7 @@ export function buildServer(opts: BuildOptions = {}): BuiltServer {
   for (const p of buildPrompts()) {
     srv.registerPrompt(p.name, { title: p.title, description: p.description, argsSchema: p.argsSchema }, async (args: unknown) => p.build((args ?? {}) as never))
   }
-  return { server, client, guard, tools }
+  return { server, registered }
 }
 
 export { loadConfig } from './config.js'

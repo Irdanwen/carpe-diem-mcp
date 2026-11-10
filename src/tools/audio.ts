@@ -54,9 +54,9 @@ export function audioTools(ctx: ToolContext): ToolDef[] {
         })
         if (res.isJson) throw new LocalRefusal('UNEXPECTED_RESPONSE', `Expected audio, got JSON: ${res.text().slice(0, 300)}`)
         const media = { bytes: res.body, mime: sniffMime(res.body) ?? (res.contentType || 'audio/mpeg') }
-        const out = mediaOutput(ctx, media, 'tts')
+        const out = await mediaOutput(ctx, media, 'tts')
         const structured = { model, audio: out.info, cost: costInfo(res.meta, estimate, ctx.guard), route: routeInfo(surface, res.meta), ...(notes.length ? { notes } : {}) }
-        return ok(`Speech generated (${media.mime}, ${media.bytes.length} bytes)${out.info.file ? ` — saved to ${out.info.file}` : ''}.\n${JSON.stringify({ cost: structured.cost, route: structured.route })}`, structured, out.content)
+        return ok(`Speech generated (${media.mime}, ${media.bytes.length} bytes)${out.info.file ? ` — saved to ${out.info.file}` : ''}${out.info.note ? ` — ${out.info.note}` : ''}.\n${JSON.stringify({ cost: structured.cost, route: structured.route })}`, structured, out.content)
       }),
     },
     {

@@ -12,11 +12,15 @@
  *   - CARPE_X402_PRIVATE_KEY + BUDGET → x402 `carpe-session`: one EIP-2612 permit
  *                                       whose value is a hard on-chain spending cap.
  *   The API key wins when both are set.
+ *   - Remote mode (CARPE_MCP_REMOTE=1 / --remote, hosted): neither. Each request
+ *     carries the signed-in user's OAuth token, relayed to the operator; setting
+ *     a key, a wallet or an output directory is a configuration error.
  */
 import { createRequire } from 'node:module'
 
 export type Surface = 'carpe' | 'router'
-export type PaymentMode = 'api_key' | 'x402' | 'none'
+/** `oauth`: remote mode — each request carries the signed-in user's access token, relayed to the operator. */
+export type PaymentMode = 'api_key' | 'x402' | 'oauth' | 'none'
 
 export interface Config {
   baseUrl: string
@@ -38,6 +42,8 @@ export interface Config {
   maxVideoBytes: number
   serverName: string
   serverVersion: string
+  /** Hosted multi-user mode (`--remote`): no server-held credentials, no local disk. */
+  remote: boolean
 }
 
 const PACKAGE_VERSION: string = createRequire(import.meta.url)('../package.json').version
@@ -64,7 +70,18 @@ function optionalNum(value: string | undefined): number | undefined {
 
 export class ConfigError extends Error {}
 
+export const isRemoteEnv = (env: NodeJS.ProcessEnv = process.env) => env.CARPE_MCP_REMOTE === '1' || env.CARPE_MCP_REMOTE === 'true'
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const remote = isRemoteEnv(env)
+  if (remote) {
+    // The hosted server acts for whoever signed in: it must hold no credential of its own.
+    for (const name of ['CARPE_API_KEY', 'CARPE_X402_PRIVATE_KEY', 'CARPE_X402_BUDGET_USD', 'CARPE_MCP_AUTH_TOKEN', 'CARPE_OUTPUT_DIR'] as const) {
+      if (env[name]?.trim()) {
+        throw new ConfigError(`${name} must not be set in remote mode: the hosted server holds no credential and writes nothing to disk (each user's OAuth token is relayed to the operator).`)
+      }
+    }
+  }
   const apiKey = env.CARPE_API_KEY?.trim() || undefined
   if (apiKey && !/^cdm_[0-9a-fA-F]{16,}$/.test(apiKey)) {
     throw new ConfigError('CARPE_API_KEY must be a Carpe Diem API key (cdm_ followed by hex characters).')
@@ -101,7 +118,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     x402RpcUrl: env.CARPE_X402_RPC_URL?.trim() || 'https://mainnet.base.org',
     x402Escrow: env.CARPE_X402_ESCROW?.trim() || undefined,
     x402Asset: env.CARPE_X402_ASSET?.trim() || undefined,
-    maxSpendUsd: num(env.CARPE_MAX_SPEND_USD, 5, { allowZero: true }),
+    // Remote: the authoritative cap is the connector key's daily cap on the operator; this one is per user and per UTC day.
+    maxSpendUsd: num(env.CARPE_MAX_SPEND_USD, remote ? 0 : 5, { allowZero: true }),
     maxPerCallUsd: num(env.CARPE_MAX_PER_CALL_USD, 0.5, { allowZero: true }),
     readOnly: env.CARPE_READ_ONLY === '1' || env.CARPE_READ_ONLY === 'true',
     defaultRoute: route,
@@ -113,10 +131,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxVideoBytes: num(env.CARPE_MAX_VIDEO_BYTES, 64 * MiB, { min: 1024 }),
     serverName: 'carpe-diem-mcp',
     serverVersion: PACKAGE_VERSION,
+    remote,
   }
 }
 
 export function paymentMode(cfg: Config): PaymentMode {
+  if (cfg.remote) return 'oauth'
   if (cfg.apiKey) return 'api_key'
   if (cfg.x402PrivateKey) return 'x402'
   return 'none'
