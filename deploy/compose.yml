@@ -1,0 +1,22 @@
+# Hosted MCP server — one container, behind the host's Nginx (deploy/nginx-mcp.carpe-diem.xyz.conf).
+# The image is built from a release tag (see deploy/README.md); set MCP_VERSION accordingly.
+services:
+  carpe-mcp:
+    image: carpe-diem-mcp:${MCP_VERSION:?set MCP_VERSION, e.g. 0.2.0}
+    container_name: carpe-mcp
+    restart: unless-stopped
+    env_file: ./mcp.env
+    # Loopback only: Nginx terminates TLS and is the only way in.
+    ports:
+      - "127.0.0.1:3333:3333"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }

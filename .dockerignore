@@ -1,0 +1,13 @@
+node_modules
+dist
+out
+coverage
+test
+examples
+deploy
+.git
+.github
+.env
+.env.*
+*.log
+.DS_Store
