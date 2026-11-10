@@ -3,7 +3,7 @@
   "name": "carpe-diem",
   "displayName": "Carpe Diem",
   "description": "Venice AI models (text, image, video, speech, music, embeddings, web) at Carpe Diem marketplace prices: TEE-only /v1 or best-price /router, spend guards, optional x402 pay-per-call on Base.",
-  "homepage": "https://github.com/Irdanwen/carpe-diem-mcp",
+  "homepage": "https://github.com/Lumen-labs-ch/carpe-diem-mcp",
   "license": "MIT",
   "version": "0.1.1",
   "keywords": ["venice", "carpe-diem", "x402", "base", "usdc", "router", "tee", "image-generation", "video-generation", "tts"],

@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.Irdanwen/carpe-diem-mcp",
+  "name": "io.github.Lumen-labs-ch/carpe-diem-mcp",
   "description": "Venice AI models via Carpe Diem: TEE or best-price routing, spend limits, x402 pay-per-call.",
   "repository": {
-    "url": "https://github.com/Irdanwen/carpe-diem-mcp",
+    "url": "https://github.com/Lumen-labs-ch/carpe-diem-mcp",
     "source": "github"
   },
   "websiteUrl": "https://carpe-diem.xyz/docs/integrations",
