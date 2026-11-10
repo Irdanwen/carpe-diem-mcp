@@ -48,7 +48,7 @@ curl -s https://mcp.carpe-diem.xyz/.well-known/oauth-protected-resource/mcp | jq
 # {"resource": "https://mcp.carpe-diem.xyz", "authorization_servers": ["https://compte.carpe-diem.xyz"]}
 
 curl -si -X POST https://mcp.carpe-diem.xyz/mcp -H 'content-type: application/json' -d '{}' | grep -i '^www-authenticate'
-# WWW-Authenticate: Bearer error="invalid_token", ..., resource_metadata="https://mcp.carpe-diem.xyz/.well-known/oauth-protected-resource/mcp"
+# WWW-Authenticate: Bearer error="invalid_token", error_description="Missing Authorization header", resource_metadata="https://mcp.carpe-diem.xyz/.well-known/oauth-protected-resource"
 ```
 
 Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude.ai connector and a real ChatGPT server on a capped test account).
