@@ -26,10 +26,10 @@ import { InsufficientScopeError, InvalidTokenError } from '@modelcontextprotocol
 import type { OAuthTokenVerifier } from '@modelcontextprotocol/sdk/server/auth/provider.js'
 import type { OAuthProtectedResourceMetadata } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { CarpeClient } from '../carpe-client.js'
+import { CarpeClient, PublicReadCache } from '../carpe-client.js'
 import { ConfigError, loadConfig, type Config } from '../config.js'
 import { MediaStore } from '../remote/media-store.js'
-import { loadRemoteConfig, SUPPORTED_SCOPES, type RemoteConfig } from '../remote/config.js'
+import { loadRemoteConfig, MAX_BODY_BYTES, SUPPORTED_SCOPES, type RemoteConfig } from '../remote/config.js'
 import { safeName, stderrLogger, subHasher, type RemoteLogger } from '../remote/log.js'
 import { REMOTE_REMOVED_TOOLS } from '../remote/policy.js'
 import { buildRemoteServer, remoteToolScopes, type RemoteMcp } from '../remote/session.js'
@@ -125,7 +125,9 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   }
   const store = new MediaStore(rc.mediaStoreBytes, rc.resource)
   // Shared by every user, and harmless: it only reads public prices and quotes, with no credential.
-  const estimator = new Estimator(new CarpeClient(cfg, undefined, opts.fetchImpl))
+  // Public catalogue reads, shared by the estimator and every session for 60 s (one anonymous operator bucket).
+  const publicReads = new PublicReadCache(60_000)
+  const estimator = new Estimator(new CarpeClient(cfg, undefined, opts.fetchImpl, undefined, undefined, publicReads))
   const known = (n: string) => n in TOOL_ANNOTATIONS && !REMOTE_REMOVED_TOOLS.has(n)
 
   const resourceUrl = new URL(rc.resource)
@@ -188,8 +190,60 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     next()
   }
 
+  /** Run `release` once, when the response is over (sent, failed or aborted). */
+  const onDone = (res: Response, release: () => void) => {
+    let done = false
+    res.on('close', () => {
+      if (done) return
+      done = true
+      release()
+    })
+  }
+
+  // Per-user concurrency: POSTs being processed (a tool call can last minutes). The GET event stream is not counted.
+  const inflight = new Map<string, number>()
+  const concurrency = (req: Request, res: Response, next: NextFunction) => {
+    const sub = subOf(req)
+    const n = inflight.get(sub) ?? 0
+    if (n >= rc.maxInflightPerUser) {
+      return void rpcError(res, 429, `Too many requests in progress for this account (at most ${rc.maxInflightPerUser}); wait for one to finish.`, { 'Retry-After': '2' })
+    }
+    inflight.set(sub, n + 1)
+    onDone(res, () => {
+      const m = (inflight.get(sub) ?? 1) - 1
+      if (m > 0) inflight.set(sub, m)
+      else inflight.delete(sub)
+    })
+    next()
+  }
+
+  // Global budget of request-body bytes held in memory (parsing, then the call), counted from
+  // Content-Length BEFORE parsing; a body without Content-Length counts as the per-request maximum.
+  let bodyBytes = 0
+  const bodyBudget = (req: Request, res: Response, next: NextFunction) => {
+    const declared = Number(req.headers['content-length'])
+    const n = req.headers['content-length'] !== undefined && Number.isFinite(declared) && declared >= 0 ? declared : MAX_BODY_BYTES
+    if (n > MAX_BODY_BYTES) return void rpcError(res, 413, 'Request body too large.')
+    if (bodyBytes + n > rc.bodyBudgetBytes) return void rpcError(res, 503, 'The server is busy with other large requests; retry shortly.', { 'Retry-After': '5' })
+    bodyBytes += n
+    onDone(res, () => {
+      bodyBytes -= n
+    })
+    next()
+  }
+
   // Bodies are parsed only after authentication. A parse error is answered without echoing (or logging) the body.
-  const json = express.json({ limit: '40mb' })
+  const json = express.json({ limit: MAX_BODY_BYTES })
+
+  // A JSON-RPC batch counts one request per message against the user's bucket (the first was taken before
+  // parsing). A batch larger than the burst could never pass: refused outright.
+  const batchCost = (req: Request, res: Response, next: NextFunction) => {
+    if (!Array.isArray(req.body) || req.body.length <= 1) return next()
+    if (req.body.length > rc.rateBurst) return void rpcError(res, 400, `JSON-RPC batch too large (at most ${rc.rateBurst} messages).`)
+    const wait = users.take(subOf(req), Date.now(), req.body.length - 1)
+    if (wait > 0) return void rpcError(res, 429, 'Too many requests for this account; slow down.', { 'Retry-After': String(wait) })
+    next()
+  }
 
   // Request log: method, tool, status, duration, hashed user. Registered first so 401s are logged too.
   const access = (req: Request, res: Response, next: NextFunction) => {
@@ -266,7 +320,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     s.transport.close().catch(() => undefined)
   }
 
-  app.post('/mcp', access, originCheck, bearer, rateLimit, json, handled(async (req, res) => {
+  app.post('/mcp', access, originCheck, bearer, rateLimit, concurrency, bodyBudget, json, batchCost, handled(async (req, res) => {
     const existing = sessionFor(req, res)
     if (existing === null) return
     if (!scopeChallenge(req, res)) return
@@ -291,6 +345,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
         log,
         fetchImpl: opts.fetchImpl,
         store,
+        publicReads,
       })
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),

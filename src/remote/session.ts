@@ -7,7 +7,7 @@
  */
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
-import { CarpeClient } from '../carpe-client.js'
+import { CarpeClient, type PublicReadCache } from '../carpe-client.js'
 import type { Config } from '../config.js'
 import { LocalRefusal } from '../errors.js'
 import { createMcpServer } from '../server.js'
@@ -34,6 +34,8 @@ export interface RemoteSessionOptions {
   fetchImpl?: typeof fetch
   /** Shared temporary media store (GET /media/<id>). */
   store?: MediaStore
+  /** Shared cache of the public catalogue reads. */
+  publicReads?: PublicReadCache
 }
 
 export interface RemoteMcp {
@@ -46,7 +48,7 @@ export interface RemoteMcp {
 
 export function buildRemoteServer(opts: RemoteSessionOptions): RemoteMcp {
   const { cfg } = opts
-  const client = new CarpeClient(cfg, undefined, opts.fetchImpl, opts.token, opts.onTokenRejected)
+  const client = new CarpeClient(cfg, undefined, opts.fetchImpl, opts.token, opts.onTokenRejected, opts.publicReads)
   const ctx: ToolContext = {
     client,
     cfg,

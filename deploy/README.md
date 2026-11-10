@@ -64,6 +64,20 @@ Then the end-to-end checks of lot B6 (MCP Inspector in OAuth mode, a real claude
 - The container has a Docker `HEALTHCHECK` and `restart: unless-stopped`.
 - Logs: `docker logs carpe-mcp` (JSON lines: method, tool, status, duration, error code, HMAC of the user id; never prompts, outputs, tokens or media ids). Nginx: `/var/log/nginx/mcp.access.log`, without query strings, and `/media/<id>` logged as `/media/-` (the id is the capability).
 
+## Memory
+
+`compose.yml` sets `mem_limit: 1g` and a V8 heap of 576 MiB (`NODE_OPTIONS`). Measured on the application (macOS, Node 22, mock operator; Linux in a container is a little lower):
+
+| | Default | Measured | Budgeted |
+|---|---|---|---|
+| Baseline (built CLI, idle) | | ~126 MiB RSS | ~130 MiB |
+| Live sessions (`CARPE_MCP_MAX_SESSIONS`) | 200 | ~660 KiB of heap, ~760 KiB RSS each (300 sessions) | ~150 MiB |
+| Request bodies in memory (`CARPE_MCP_BODY_BUDGET_MB`) | 128 MB | 3 × 39 MB bodies admitted out of 8 sent at once: heap +256 MiB, RSS +320 MiB (~107 MiB each) | ~320 MiB |
+| Media store (`CARPE_MCP_MEDIA_STORE_MB`, outside the heap) | 256 MiB | | 256 MiB |
+| **Total** | | | **~856 MiB of 1 GiB** |
+
+Heap at most: ~40 (baseline) + ~130 (sessions) + ~256 (bodies) ≈ 430 MiB, under the 576 MiB cap. Raising one of the budgets means raising `mem_limit` (and, for sessions or bodies, `--max-old-space-size`) by as much.
+
 ## Update and rollback
 
 ```bash

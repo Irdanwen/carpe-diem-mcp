@@ -37,7 +37,14 @@ export interface RemoteConfig {
   logSalt: string | undefined
   /** Byte budget of the temporary media store (outputs too large to return inline, and the room held for them). */
   mediaStoreBytes: number
+  /** POST /mcp requests of one user being processed at once (beyond: 429). */
+  maxInflightPerUser: number
+  /** Request-body bytes being parsed or processed, all users together (beyond: 503). */
+  bodyBudgetBytes: number
 }
+
+/** Largest JSON body of one request (data: URIs of media inputs). */
+export const MAX_BODY_BYTES = 40 * 1024 * 1024
 
 const LOOPBACK = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])$/i
 
@@ -79,9 +86,13 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     ratePerMinute: int(env, 'CARPE_MCP_RATE_PER_MIN', 120, 1),
     rateBurst: int(env, 'CARPE_MCP_RATE_BURST', 30, 1),
     maxSessionsPerUser: int(env, 'CARPE_MCP_MAX_SESSIONS_PER_USER', 5, 1),
-    maxSessions: int(env, 'CARPE_MCP_MAX_SESSIONS', 1000, 1),
+    // About 0.7 MiB of heap per session (an McpServer with its tools): 200 ≈ 150 MiB, see deploy/compose.yml.
+    maxSessions: int(env, 'CARPE_MCP_MAX_SESSIONS', 200, 1),
     logSalt: env.CARPE_MCP_LOG_SALT?.trim() || undefined,
     // At least the largest single output (a 64 MiB video), so any one of them can be kept.
     mediaStoreBytes: int(env, 'CARPE_MCP_MEDIA_STORE_MB', 256, 64) * 1024 * 1024,
+    maxInflightPerUser: int(env, 'CARPE_MCP_MAX_INFLIGHT_PER_USER', 4, 1),
+    // At least one request of the largest size.
+    bodyBudgetBytes: int(env, 'CARPE_MCP_BODY_BUDGET_MB', 128, 40) * 1024 * 1024,
   }
 }

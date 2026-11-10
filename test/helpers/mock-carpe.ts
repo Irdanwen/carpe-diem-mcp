@@ -311,6 +311,10 @@ export async function startMockCarpe(): Promise<MockCarpe> {
         return send(res, 200, { queue_id: 'rvid-1', market: 'surplus', status: 'queued' }, { 'x-carpe-route-market': 'surplus' })
       case 'POST /v1/video/retrieve':
         if (!needKey()) return
+        if (body.queue_id === 'slow-vid') {
+          await new Promise((r) => setTimeout(r, 400))
+          return send(res, 200, { status: 'processing' })
+        }
         if (bump('video-poll') < 2) return send(res, 200, { status: 'processing' })
         return send(res, 200, { status: 'completed', video_url: '/v1/video/file/abc123' })
       case 'POST /router/video/retrieve':

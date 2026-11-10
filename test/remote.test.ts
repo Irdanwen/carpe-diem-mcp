@@ -5,7 +5,7 @@
 import { after, before, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { createServer, type Server } from 'node:http'
+import { createServer, request as httpRequest, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -514,6 +514,119 @@ describe('media without a disk', () => {
     assert.ok(st.content.some((c) => c.type === 'resource_link' && c.uri === `${mock.base}/v1/video/file/abc123`))
     assert.ok(!mock.calls.some((c) => c.path === '/v1/video/file/abc123'), 'the server did not download the video')
     await client.close()
+  })
+})
+
+describe('rate and memory', () => {
+  const slowCall = toolCall('carpe_video_status', { job_id: 'v1:video:slow-vid:m', wait_seconds: 0 })
+  const session = async (r: Remote, t: string) => {
+    const res = await rpc(r, t, INIT)
+    await res.text()
+    return res.headers.get('mcp-session-id')!
+  }
+  /** Headers only: the server answers before reading a body, so none is sent. */
+  const headersOnly = (r: Remote, t: string, headers: Record<string, string>) =>
+    new Promise<number>((resolve, reject) => {
+      const u = new URL(`${r.url}/mcp`)
+      const req = httpRequest({ host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, authorization: `Bearer ${t}`, ...headers } }, (res) => {
+        resolve(res.statusCode ?? 0)
+        req.destroy()
+      })
+      req.on('error', (e) => (e.message.includes('socket hang up') ? undefined : reject(e)))
+      req.flushHeaders()
+    })
+
+  test('each message of a JSON-RPC batch counts against the user\'s bucket; a batch above the burst is refused', async () => {
+    const r = await startRemote({ CARPE_MCP_RATE_BURST: '5', CARPE_MCP_RATE_PER_MIN: '1' })
+    try {
+      const t = await tokenFor(r, { sub: 'batcher' })
+      const sid = await session(r, t) // 1 of 5
+      const ping = (id: number) => ({ jsonrpc: '2.0', id, method: 'ping' })
+      assert.equal((await rpc(r, t, [ping(1), ping(2), ping(3), ping(4), ping(5), ping(6)], sid)).status, 400, 'above the burst')
+      const batch = await rpc(r, t, [ping(1), ping(2), ping(3)], sid) // 1 + 2 = 3 more: 4 of 5
+      assert.notEqual(batch.status, 429)
+      await batch.text()
+      assert.equal((await rpc(r, t, [ping(7), ping(8)], sid)).status, 429, 'the batch counted three')
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('requests in progress per user are capped (429 + Retry-After); other users are not affected', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_INFLIGHT_PER_USER: '1' })
+    try {
+      const a = await tokenFor(r, { sub: 'slow-a' })
+      const sa = await session(r, a)
+      const slow = rpc(r, a, slowCall, sa)
+      await new Promise((res) => setTimeout(res, 100))
+      const busy = await rpc(r, a, { jsonrpc: '2.0', id: 9, method: 'ping' }, sa)
+      assert.equal(busy.status, 429)
+      assert.equal(busy.headers.get('retry-after'), '2')
+      const b = await tokenFor(r, { sub: 'slow-b' })
+      assert.equal((await rpc(r, b, INIT)).status, 200)
+      const done = await slow
+      assert.equal(done.status, 200)
+      await done.text()
+      const again = await rpc(r, a, { jsonrpc: '2.0', id: 10, method: 'ping' }, sa)
+      assert.equal(again.status, 200, 'the slot is freed when the response ends')
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('request bodies share a global byte budget counted from Content-Length (503 + Retry-After); no Content-Length counts as the maximum', async () => {
+    const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '40' })
+    try {
+      const a = await tokenFor(r, { sub: 'body-a' })
+      const sa = await session(r, a)
+      assert.equal(await headersOnly(r, a, { 'content-length': String(41 * 1024 * 1024) }), 413)
+      // A small call in progress holds its bytes: a body of the whole budget no longer fits.
+      const slow = rpc(r, a, slowCall, sa)
+      await new Promise((res) => setTimeout(res, 100))
+      const b = await tokenFor(r, { sub: 'body-b' })
+      assert.equal(await headersOnly(r, b, { 'content-length': String(40 * 1024 * 1024) }), 503)
+      assert.equal(await headersOnly(r, b, { 'transfer-encoding': 'chunked' }), 503)
+      const small = await rpc(r, b, INIT)
+      assert.equal(small.status, 200, 'small bodies still fit')
+      await small.text()
+      const done = await slow
+      assert.equal(done.status, 200)
+      await done.text()
+      await new Promise((res) => setTimeout(res, 50))
+      const sb = await session(r, b)
+      const big = await rpc(r, b, { jsonrpc: '2.0', id: 11, method: 'ping', params: { pad: 'A'.repeat(39 * 1024 * 1024) } }, sb)
+      assert.notEqual(big.status, 503, 'room again once the call is over')
+      await big.text()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('public catalogue reads are shared by every session for 60 s', async () => {
+    const r = await startRemote()
+    try {
+      const c1 = await connect(r, await tokenFor(r, { sub: 'cat-1' }))
+      const c2 = await connect(r, await tokenFor(r, { sub: 'cat-2' }))
+      const from = mock.calls.length
+      for (const c of [c1, c2]) {
+        assert.equal((await call(c.client, 'carpe_list_models', {})).isError, false)
+        assert.equal((await call(c.client, 'carpe_list_models', { type: 'image' })).isError, false)
+        assert.equal((await call(c.client, 'carpe_model_details', { model: 'tts-kokoro' })).isError, false)
+        await c.client.readResource({ uri: 'carpe://models' })
+      }
+      assert.equal(mock.calls.slice(from).filter((c) => c.path === '/v1/models').length, 1)
+      for (const c of [c1, c2]) await c.client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('defaults', () => {
+    const d = loadRemoteConfig({})
+    assert.equal(d.maxSessions, 200)
+    assert.equal(d.maxInflightPerUser, 4)
+    assert.equal(d.bodyBudgetBytes, 128 * 1024 * 1024)
+    assert.throws(() => loadRemoteConfig({ CARPE_MCP_BODY_BUDGET_MB: '39' }), ConfigError)
   })
 })
 
