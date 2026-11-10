@@ -622,11 +622,61 @@ describe('rate and memory', () => {
     }
   })
 
+  test('a stalled upload is cut (408) and its bytes are freed', async () => {
+    const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '40', CARPE_MCP_BODY_TIMEOUT_S: '1' })
+    try {
+      const a = await tokenFor(r, { sub: 'trickler' })
+      const b = await tokenFor(r, { sub: 'patient' })
+      const started = Date.now()
+      const stalled = new Promise<number>((resolve, reject) => {
+        const u = new URL(`${r.url}/mcp`)
+        const req = httpRequest(
+          { host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, authorization: `Bearer ${a}`, 'content-length': String(40 * 1024 * 1024) } },
+          (res) => {
+            resolve(res.statusCode ?? 0)
+            req.destroy()
+          },
+        )
+        req.on('error', (e) => (/hang up|ECONNRESET|EPIPE/.test(e.message) ? undefined : reject(e)))
+        req.write('{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"' + 'A'.repeat(1024)) // …then nothing
+      })
+      await new Promise((res) => setTimeout(res, 200))
+      assert.equal(await headersOnly(r, b, { 'content-length': String(40 * 1024 * 1024) }), 503, 'held by the stalled upload')
+      assert.equal(await stalled, 408)
+      assert.ok(Date.now() - started < 3000, 'cut after the body deadline')
+      await new Promise((res) => setTimeout(res, 50))
+      // Freed: B's request is admitted now (and, sending nothing either, is cut in turn instead of refused).
+      assert.equal(await headersOnly(r, b, { 'content-length': String(40 * 1024 * 1024) }), 408)
+      assert.equal((await fetch(`${r.url}/health`)).status, 200)
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('each user has a share of the body budget: one user at their share does not block another', async () => {
+    const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '128', CARPE_MCP_BODY_BUDGET_PER_USER_MB: '48', CARPE_MCP_BODY_TIMEOUT_S: '1' })
+    try {
+      const a = await tokenFor(r, { sub: 'hog' })
+      const b = await tokenFor(r, { sub: 'neighbour' })
+      const big = { 'content-length': String(40 * 1024 * 1024) }
+      const first = headersOnly(r, a, big) // admitted, then cut by the deadline
+      await new Promise((res) => setTimeout(res, 100))
+      assert.equal(await headersOnly(r, a, big), 429, 'beyond the user\'s share')
+      assert.equal(await headersOnly(r, b, big), 408, 'another user is admitted (then cut: it sends no body)')
+      assert.equal(await first, 408)
+    } finally {
+      await r.close()
+    }
+  })
+
   test('defaults', () => {
     const d = loadRemoteConfig({})
     assert.equal(d.maxSessions, 200)
     assert.equal(d.maxInflightPerUser, 4)
     assert.equal(d.bodyBudgetBytes, 128 * 1024 * 1024)
+    assert.equal(d.bodyBudgetPerUserBytes, 48 * 1024 * 1024)
+    assert.equal(d.bodyTimeoutMs, 30_000)
+    assert.equal(d.mediaStorePerUserBytes, 96 * 1024 * 1024)
     assert.throws(() => loadRemoteConfig({ CARPE_MCP_BODY_BUDGET_MB: '39' }), ConfigError)
   })
 })

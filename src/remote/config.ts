@@ -43,6 +43,10 @@ export interface RemoteConfig {
   maxInflightPerUser: number
   /** Request-body bytes being parsed or processed, all users together (beyond: 503). */
   bodyBudgetBytes: number
+  /** Each user's share of it (beyond: 429), so one account cannot hold the whole budget. */
+  bodyBudgetPerUserBytes: number
+  /** A request body must be fully received within this delay (else 408, its bytes freed). */
+  bodyTimeoutMs: number
 }
 
 /** Largest JSON body of one request (data: URIs of media inputs). */
@@ -98,5 +102,9 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     maxInflightPerUser: int(env, 'CARPE_MCP_MAX_INFLIGHT_PER_USER', 4, 1),
     // At least one request of the largest size.
     bodyBudgetBytes: int(env, 'CARPE_MCP_BODY_BUDGET_MB', 128, 40) * 1024 * 1024,
+    // One request of the largest size and a few small ones: it takes three accounts to fill the default budget.
+    bodyBudgetPerUserBytes: int(env, 'CARPE_MCP_BODY_BUDGET_PER_USER_MB', 48, 40) * 1024 * 1024,
+    // 40 MB in 30 s is ~1.4 MB/s: ChatGPT's and Anthropic's servers upload far faster; a stalled upload is cut.
+    bodyTimeoutMs: int(env, 'CARPE_MCP_BODY_TIMEOUT_S', 30, 1) * 1000,
   }
 }

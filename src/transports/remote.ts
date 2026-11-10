@@ -194,13 +194,15 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   }
 
   /** Run `release` once, when the response is over (sent, failed or aborted). */
-  const onDone = (res: Response, release: () => void) => {
+  const onDone = (res: Response, release: () => void, req?: Request) => {
     let done = false
-    res.on('close', () => {
+    const once = () => {
       if (done) return
       done = true
       release()
-    })
+    }
+    res.on('close', once)
+    req?.on('aborted', once)
   }
 
   // Per-user concurrency: POSTs being processed (a tool call can last minutes). The GET event stream is not counted.
@@ -220,18 +222,44 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     next()
   }
 
-  // Global budget of request-body bytes held in memory (parsing, then the call), counted from
-  // Content-Length BEFORE parsing; a body without Content-Length counts as the per-request maximum.
+  // Budget of request-body bytes held in memory (parsing, then the call), counted from Content-Length
+  // BEFORE parsing; a body without Content-Length counts as the per-request maximum. Global (503), and
+  // per user (429) so one account cannot hold all of it. A body not fully received in time is cut (408):
+  // a stalled upload frees its bytes quickly.
   let bodyBytes = 0
+  const bodyByUser = new Map<string, number>()
   const bodyBudget = (req: Request, res: Response, next: NextFunction) => {
+    const sub = subOf(req)
     const declared = Number(req.headers['content-length'])
     const n = req.headers['content-length'] !== undefined && Number.isFinite(declared) && declared >= 0 ? declared : MAX_BODY_BYTES
     if (n > MAX_BODY_BYTES) return void rpcError(res, 413, 'Request body too large.')
+    const mine = bodyByUser.get(sub) ?? 0
+    if (mine + n > rc.bodyBudgetPerUserBytes) {
+      return void rpcError(res, 429, 'Too much request data in progress for this account; wait for your other requests to finish.', { 'Retry-After': '5' })
+    }
     if (bodyBytes + n > rc.bodyBudgetBytes) return void rpcError(res, 503, 'The server is busy with other large requests; retry shortly.', { 'Retry-After': '5' })
     bodyBytes += n
-    onDone(res, () => {
-      bodyBytes -= n
-    })
+    bodyByUser.set(sub, mine + n)
+    const deadline = setTimeout(() => {
+      if (req.complete) return
+      if (!res.headersSent) {
+        res.once('finish', () => req.destroy())
+        rpcError(res, 408, 'Request body not received in time.', { Connection: 'close' })
+      } else req.destroy()
+    }, rc.bodyTimeoutMs)
+    deadline.unref()
+    req.once('end', () => clearTimeout(deadline))
+    onDone(
+      res,
+      () => {
+        clearTimeout(deadline)
+        bodyBytes -= n
+        const left = (bodyByUser.get(sub) ?? n) - n
+        if (left > 0) bodyByUser.set(sub, left)
+        else bodyByUser.delete(sub)
+      },
+      req,
+    )
     next()
   }
 
@@ -414,6 +442,10 @@ export async function runRemote(opts: { port: number; host?: string }): Promise<
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(opts.port, host, () => resolve(s))
   })
+  // Second barrier against slow uploads (the first is the per-request body deadline): headers within 20 s,
+  // the whole request (headers and body, not the response) within the body deadline plus 30 s.
+  server.headersTimeout = 20_000
+  server.requestTimeout = rc.bodyTimeoutMs + 30_000
   console.error(`[carpe-mcp] remote mode on http://${host}:${opts.port}/mcp — resource ${rc.resource}, issuer ${rc.issuer}`)
   return server
 }
