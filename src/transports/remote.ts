@@ -72,7 +72,20 @@ const rpcError = (res: Response, status: number, message: string, headers: Recor
   res.status(status).set(headers).json({ jsonrpc: '2.0', error: { code: -32000, message }, id: null })
 }
 
-const messagesOf = (body: unknown): Record<string, any>[] => (Array.isArray(body) ? body : body && typeof body === 'object' ? [body as Record<string, any>] : [])
+const isObject = (v: unknown): v is Record<string, any> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** The JSON-RPC messages of a body: plain objects only (a batch may hold `null`, numbers, strings…). */
+export const messagesOf = (body: unknown): Record<string, any>[] => (Array.isArray(body) ? body.filter(isObject) : isObject(body) ? [body] : [])
+
+/**
+ * Express 4 does not catch a rejected async handler: the rejection would be
+ * unhandled and stop the process. Every async handler goes through this.
+ */
+const handled =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>): express.RequestHandler =>
+  (req, res, next) => {
+    fn(req, res, next).catch(next)
+  }
 
 export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   const cfg = opts.cfg ?? loadConfig()
@@ -153,20 +166,25 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   const access = (req: Request, res: Response, next: NextFunction) => {
     const started = Date.now()
     res.on('finish', () => {
-      const msgs = messagesOf(req.body)
-      // A method name is client-chosen text: logged only when it has the shape of one.
-      const rpc = msgs.map((m) => (typeof m.method === 'string' && /^[A-Za-z0-9_/.-]{1,64}$/.test(m.method) ? m.method : 'other'))
-      const tools = msgs.filter((m) => m.method === 'tools/call').map((m) => safeName(m.params?.name, known))
-      const sub = req.auth ? subOf(req) : ''
-      log({
-        event: 'request',
-        http: req.method,
-        ...(rpc.length ? { rpc: rpc.join(',') } : {}),
-        ...(tools.length ? { tool: tools.join(',') } : {}),
-        status: res.statusCode,
-        ms: Date.now() - started,
-        ...(sub ? { user: hashSub(sub) } : {}),
-      })
+      // An exception in an event listener would stop the process: this one never throws.
+      try {
+        const msgs = messagesOf(req.body)
+        // A method name is client-chosen text: logged only when it has the shape of one.
+        const rpc = msgs.map((m) => (typeof m.method === 'string' && /^[A-Za-z0-9_/.-]{1,64}$/.test(m.method) ? m.method : 'other'))
+        const tools = msgs.filter((m) => m.method === 'tools/call').map((m) => safeName(m.params?.name, known))
+        const sub = req.auth ? subOf(req) : ''
+        log({
+          event: 'request',
+          http: req.method,
+          ...(rpc.length ? { rpc: rpc.join(',') } : {}),
+          ...(tools.length ? { tool: tools.join(',') } : {}),
+          status: res.statusCode,
+          ms: Date.now() - started,
+          ...(sub ? { user: hashSub(sub) } : {}),
+        })
+      } catch {
+        /* a log line is never worth the process */
+      }
     })
     next()
   }
@@ -219,7 +237,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     s.transport.close().catch(() => undefined)
   }
 
-  app.post('/mcp', access, originCheck, bearer, rateLimit, json, async (req, res) => {
+  app.post('/mcp', access, originCheck, bearer, rateLimit, json, handled(async (req, res) => {
     const existing = sessionFor(req, res)
     if (existing === null) return
     if (!scopeChallenge(req, res)) return
@@ -258,7 +276,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
       session = created
     }
     await session.transport.handleRequest(req, res, req.body)
-  })
+  }))
 
   const forward = async (req: Request, res: Response) => {
     const session = sessionFor(req, res)
@@ -266,8 +284,8 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     if (!session) return void rpcError(res, 400, 'Mcp-Session-Id header required.')
     await session.transport.handleRequest(req, res)
   }
-  app.get('/mcp', access, originCheck, bearer, rateLimit, forward)
-  app.delete('/mcp', access, originCheck, bearer, rateLimit, forward)
+  app.get('/mcp', access, originCheck, bearer, rateLimit, handled(forward))
+  app.delete('/mcp', access, originCheck, bearer, rateLimit, handled(forward))
 
   // Last-resort error handler: a fixed answer, never the error message (a JSON parse error quotes the body).
   app.use((err: { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {

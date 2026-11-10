@@ -383,6 +383,68 @@ describe('credentials and isolation', () => {
   })
 })
 
+describe('robustness', () => {
+  test('malformed bodies ([null], [1], "x", [{}], null in a batch) get a 4xx and the server keeps serving', async () => {
+    const r = await startRemote()
+    try {
+      const t = await tokenFor(r, { sub: 'fuzzer' })
+      const raw = (body: string, sid?: string) =>
+        fetch(`${r.url}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: ACCEPT, 'mcp-protocol-version': '2025-06-18', authorization: `Bearer ${t}`, ...(sid ? { 'mcp-session-id': sid } : {}) },
+          body,
+        })
+      for (const body of ['[null]', '[1]', '"x"', '[{}]', 'null', '[]', '[null, {"jsonrpc":"2.0","id":1,"method":"tools/call","params":null}]']) {
+        const res = await raw(body)
+        assert.ok(res.status >= 400 && res.status < 500, `${body} → ${res.status}`)
+        await res.text()
+      }
+      // Inside a live session too.
+      const { client, transport } = await connect(r, t)
+      for (const body of ['[null]', '[1]', '[{}]', '[null, {"jsonrpc":"2.0","method":"tools/call","params":{"name":null}}]']) {
+        const res = await raw(body, transport.sessionId)
+        assert.ok(res.status >= 400 && res.status < 500, `session ${body} → ${res.status}`)
+        await res.text()
+      }
+      assert.deepEqual(await (await fetch(`${r.url}/health`)).json(), { ok: true })
+      assert.ok((await client.listTools()).tools.length > 0, 'the session still works')
+      assert.ok(r.logs.some((e) => e.event === 'request' && e.status === 400))
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('the built CLI survives a [null] body', async () => {
+    const cli = join(root, 'dist', 'cli.js')
+    const probe = createServer()
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', () => r()))
+    const port = (probe.address() as AddressInfo).port
+    await new Promise<void>((r) => probe.close(() => r()))
+    const url = `http://127.0.0.1:${port}`
+    const child = spawn(process.execPath, [cli, '--remote', '--port', String(port)], {
+      env: { PATH: process.env.PATH, CARPE_TEST_BASE_URL: mock.base, CARPE_OAUTH_ISSUER: issuer.url, CARPE_MCP_PUBLIC_URL: url },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let logs = ''
+    child.stderr.on('data', (d) => (logs += d))
+    let exited = false
+    child.on('exit', () => (exited = true))
+    try {
+      for (let i = 0; i < 100 && !logs.includes('remote mode on'); i++) await new Promise((r) => setTimeout(r, 50))
+      const t = await issuer.mint({ aud: url, sub: 'cli-fuzzer' })
+      const res = await fetch(`${url}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, authorization: `Bearer ${t}` }, body: '[null]' })
+      assert.equal(res.status, 400)
+      await res.text()
+      await new Promise((r) => setTimeout(r, 100))
+      assert.equal(exited, false, 'the process is still running')
+      assert.equal((await fetch(`${url}/health`)).status, 200)
+    } finally {
+      child.kill()
+    }
+  })
+})
+
 describe('media without a disk', () => {
   test('inputs: local paths, http:// and private hosts are refused before anything is paid', async () => {
     const { client } = await connect(srv, await tokenFor(srv, { sub: 'media-in' }))
