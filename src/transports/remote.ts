@@ -49,6 +49,14 @@ interface RemoteSession {
   /** Latest validated access token of this session's user: what the operator receives. */
   token: string
   lastSeen: number
+  /** Request id → its POST's requests still unanswered (shared by the requests of one batch). */
+  pending: Map<unknown, PostGroup>
+}
+
+interface PostGroup {
+  open: Set<unknown>
+  /** One of them was cancelled: it will never be answered. */
+  cancelled: boolean
 }
 
 export interface RemoteAppOptions {
@@ -293,17 +301,26 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     next()
   }
 
-  // Per-user concurrency: POSTs being processed (a tool call can last minutes). The GET event stream is not counted.
+  // Per-user concurrency: JSON-RPC requests being processed (a tool call can last minutes). Each tools/call
+  // counts as one, a batch's included (its messages run in parallel); the other requests of a body count as
+  // one more, together. A body of notifications or responses only (notifications/cancelled…) counts for
+  // nothing, so a client at the cap can still cancel. The GET event stream is not counted.
   const inflight = new Map<string, number>()
   const concurrency = (req: Request, res: Response, next: NextFunction) => {
+    const requests = messagesOf(req.body).filter((m) => typeof m.method === 'string' && m.id !== undefined)
+    const calls = requests.filter((m) => m.method === 'tools/call').length
+    const cost = calls + (requests.length > calls ? 1 : 0)
+    if (cost === 0) return next()
+    const max = rc.maxInflightPerUser
+    if (calls > max) return void rpcError(res, 400, `JSON-RPC batch has too many tool calls (at most ${max} at once).`)
     const sub = subOf(req)
     const n = inflight.get(sub) ?? 0
-    if (n >= rc.maxInflightPerUser) {
-      return void rpcError(res, 429, `Too many requests in progress for this account (at most ${rc.maxInflightPerUser}); wait for one to finish.`, { 'Retry-After': '2' })
+    if (n + cost > max) {
+      return void rpcError(res, 429, `Too many requests in progress for this account (at most ${max} tool calls at once); wait for one to finish.`, { 'Retry-After': '2' })
     }
-    inflight.set(sub, n + 1)
+    inflight.set(sub, n + cost)
     onDone(res, () => {
-      const m = (inflight.get(sub) ?? 1) - 1
+      const m = (inflight.get(sub) ?? cost) - cost
       if (m > 0) inflight.set(sub, m)
       else inflight.delete(sub)
     })
@@ -395,7 +412,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     s.transport.close().catch(() => undefined)
   }
 
-  app.post('/mcp', access, originCheck, bearer, rateLimit, concurrency, bodyBudget, readBody, parseBody, batchCost, handled(async (req, res) => {
+  app.post('/mcp', access, originCheck, bearer, rateLimit, bodyBudget, readBody, parseBody, batchCost, concurrency, handled(async (req, res) => {
     const existing = sessionFor(req, res)
     if (existing === null) return
     if (!scopeChallenge(req, res)) return
@@ -431,12 +448,44 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
       transport.onclose = () => {
         if (transport.sessionId) sessions.delete(transport.sessionId)
       }
-      created = { transport, mcp, sub, token: req.auth!.token, lastSeen: Date.now() }
+      created = { transport, mcp, sub, token: req.auth!.token, lastSeen: Date.now(), pending: new Map() }
+      // Track which requests of each POST are answered (see endCancelled).
+      const send = transport.send.bind(transport)
+      transport.send = async (message, options) => {
+        await send(message, options)
+        if ('id' in message && ('result' in message || 'error' in message)) settle(created, message.id, false)
+      }
       await mcp.server.connect(transport)
       session = created
     }
+    const msgs = messagesOf(req.body)
+    const ids = msgs.filter((m) => typeof m.method === 'string' && m.id !== undefined).map((m) => m.id)
+    if (ids.length) {
+      const group: PostGroup = { open: new Set(ids), cancelled: false }
+      const s = session
+      for (const id of ids) s.pending.set(id, group)
+      onDone(res, () => {
+        for (const id of ids) if (s.pending.get(id) === group) s.pending.delete(id)
+      })
+    }
     await session.transport.handleRequest(req, res, req.body)
+    for (const m of msgs) if (m.method === 'notifications/cancelled' && m.id === undefined) settle(session, m.params?.requestId, true)
   }))
+
+  /**
+   * Request `id` was answered, or cancelled. The SDK never answers a cancelled request (as the spec says),
+   * so the POST that carried it would stay open, holding its concurrency slots, until the client hangs up:
+   * once every request of that POST is answered or cancelled, and one was cancelled, its stream is closed,
+   * which ends the response and frees the slots.
+   */
+  const settle = (s: RemoteSession, id: unknown, cancelled: boolean) => {
+    const group = s.pending.get(id)
+    if (!group) return
+    s.pending.delete(id)
+    group.open.delete(id)
+    if (cancelled) group.cancelled = true
+    if (group.cancelled && group.open.size === 0) s.transport.closeSSEStream(id as string | number)
+  }
 
   const forward = async (req: Request, res: Response) => {
     const session = sessionFor(req, res)

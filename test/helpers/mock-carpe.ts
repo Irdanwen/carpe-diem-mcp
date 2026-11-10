@@ -319,6 +319,8 @@ export async function startMockCarpe(): Promise<MockCarpe> {
         return send(res, 200, { status: 'completed', video_url: '/v1/video/file/abc123' })
       case 'POST /router/video/retrieve':
         if (!needKey()) return
+        // A slow download: concurrent polls of this job overlap.
+        if (body.queue_id === 'rvid-slow') await new Promise((r) => setTimeout(r, 300))
         return send(res, 200, MP4, { 'content-type': 'video/mp4' })
       case 'GET /v1/video/file/abc123':
         return send(res, 200, MP4, { 'content-type': 'video/mp4' })

@@ -656,6 +656,39 @@ describe('rate and memory', () => {
     }
   })
 
+  test('concurrency counts each tools/call of a batch; notifications (cancel) are never refused by it', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_INFLIGHT_PER_USER: '2' })
+    try {
+      const a = await tokenFor(r, { sub: 'batch-calls' })
+      const sa = await session(r, a)
+      const slowBatch = (n: number, from = 20) => Array.from({ length: n }, (_, i) => ({ ...slowCall, id: from + i }))
+      assert.equal((await rpc(r, a, slowBatch(3), sa)).status, 400, 'three tool calls can never fit under 2')
+      // Two calls that would poll for 30 s.
+      const long = (id: number) => toolCall('carpe_video_status', { job_id: 'v1:video:slow-vid:m', wait_seconds: 30 })
+      const started = Date.now()
+      const two = rpc(r, a, [{ ...long(20), id: 20 }, { ...long(21), id: 21 }], sa)
+      await new Promise((res) => setTimeout(res, 150))
+      const busy = await rpc(r, a, { ...slowCall, id: 30 }, sa)
+      assert.equal(busy.status, 429, 'the batch holds both slots')
+      await busy.text()
+      // At the cap, cancellations (notifications: no id) still go through.
+      for (const requestId of [20, 21]) {
+        const cancel = await rpc(r, a, { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId, reason: 'user' } }, sa)
+        assert.equal(cancel.status, 202)
+      }
+      // The SDK answers neither: the POST is ended by the server once both are cancelled, freeing the slots.
+      const done = await two
+      assert.equal(done.status, 200)
+      await done.text()
+      assert.ok(Date.now() - started < 5000, 'ended at the cancellation, not after the 30 s wait')
+      const after = await rpc(r, a, slowBatch(2, 40), sa)
+      assert.equal(after.status, 200, 'both slots freed')
+      await after.text()
+    } finally {
+      await r.close()
+    }
+  })
+
   test('request bodies share a global byte budget counted from Content-Length (503 + Retry-After); no Content-Length counts as the maximum', async () => {
     const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '40' })
     try {
@@ -869,8 +902,9 @@ describe('temporary media store', () => {
 
       const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
       assert.equal(vs.isError, true, 'never isError:false without the video')
-      assert.match(vs.text, /MEDIA_STORE_FULL/)
+      assert.match(vs.text, /MEDIA_STORE_FULL[\s\S]*not downloaded[\s\S]*Nothing is lost/)
       assert.ok(vs.text.includes(v.structured.job_id))
+      assert.ok(!sent('/router/video/retrieve'), 'no room for the video: it is not downloaded')
 
       const gi = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
       assert.equal(gi.isError, true)
@@ -880,12 +914,13 @@ describe('temporary media store', () => {
       assert.ok(!sent('/v1/image/generate/complete'), 'the operator keeps the undelivered image')
 
       // Room again: every job is delivered, nothing was lost.
+      // (The video first: its retrieve holds room for the largest video, the whole of this 64 MiB store.)
       r.remote.store.clear()
+      const vs2 = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs2.isError, false, vs2.text)
       const ms2 = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
       assert.equal(ms2.isError, false, ms2.text)
       assert.equal(ms2.structured.audio.storage, 'hosted_mcp')
-      const vs2 = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
-      assert.equal(vs2.isError, false, vs2.text)
       const gi2 = await call(client, 'carpe_image_status', { job_id: jobId, wait_seconds: 0 })
       assert.equal(gi2.isError, false, gi2.text)
       assert.ok(await waitFor(() => sent('/v1/image/generate/complete')))
@@ -935,6 +970,68 @@ describe('temporary media store', () => {
     } finally {
       await r.close()
     }
+  })
+
+  test('30 concurrent polls of the same router video (one batch) download it once, with one reservation', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_INFLIGHT_PER_USER: '30', CARPE_MCP_RATE_BURST: '40' })
+    try {
+      const t = await tokenFor(r, { sub: 'poll-storm' })
+      const init = await rpc(r, t, INIT)
+      await init.text()
+      const sid = init.headers.get('mcp-session-id')!
+      const job = 'router:video:rvid-slow:kling-2.5-turbo-pro-text-to-video'
+      const from = mock.calls.length
+      const batch = Array.from({ length: 30 }, (_, i) => ({ ...toolCall('carpe_video_status', { job_id: job, wait_seconds: 0 }), id: 100 + i }))
+      const res = await rpc(r, t, batch, sid)
+      assert.equal(res.status, 200)
+      const text = await res.text()
+      const results = text
+        .split('\n')
+        .filter((l) => l.startsWith('data: '))
+        .flatMap((l) => [JSON.parse(l.slice(6))].flat())
+      assert.equal(results.length, 30)
+      const urls = new Set(results.map((m: any) => m.result?.structuredContent?.video?.url))
+      assert.equal(urls.size, 1, 'one link for all')
+      assert.ok([...urls][0], text.slice(0, 300))
+      assert.ok(results.every((m: any) => !m.result.isError))
+      assert.equal(mock.calls.slice(from).filter((c) => c.path === '/router/video/retrieve').length, 1, 'downloaded once')
+      assert.equal(r.remote.store.size, 1)
+      assert.equal(r.remote.store.free, r.remote.store.maxBytes - MP4.length, 'the reservation was released')
+      assert.equal(r.remote.store.flights.size, 0)
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('single flight: callers share one run; one caller cancelling leaves the others waiting', async () => {
+    const { SingleFlight } = await import('../src/remote/single-flight.js')
+    const f = new SingleFlight()
+    let runs = 0
+    let aborted = false
+    let finish!: (v: string) => void
+    const work = (signal: AbortSignal) => {
+      runs++
+      signal.addEventListener('abort', () => (aborted = true))
+      return new Promise<string>((res) => (finish = res))
+    }
+    const c1 = new AbortController()
+    const p1 = f.run('k', work, c1.signal)
+    const p2 = f.run('k', work)
+    await new Promise((res) => setImmediate(res))
+    c1.abort()
+    await assert.rejects(p1, /Cancelled/)
+    assert.equal(aborted, false, 'another caller still waits')
+    finish('done')
+    assert.equal(await p2, 'done')
+    assert.equal(runs, 1)
+    // Everyone gone: the run is aborted, and the next caller starts afresh.
+    const c3 = new AbortController()
+    const p3 = f.run('k', work, c3.signal)
+    await new Promise((res) => setImmediate(res))
+    c3.abort()
+    await assert.rejects(p3, /Cancelled/)
+    assert.equal(aborted, true)
+    assert.equal(f.size, 0)
   })
 
   test('each user has a share of the store: one user at their share does not block another', async () => {
