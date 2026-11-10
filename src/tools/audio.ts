@@ -91,7 +91,7 @@ export function audioTools(ctx: ToolContext): ToolDef[] {
         const media = await loadMedia(a.audio, { ...ctx.media, maxInputBytes: 19 * 1024 * 1024 }, 'audio/mpeg')
         const model = a.model ?? 'openai/whisper-large-v3'
         const form = new FormData()
-        form.append('file', new Blob([new Uint8Array(media.bytes)], { type: media.mime }), `audio.${extFor(media.mime)}`)
+        form.append('file', new Blob([media.bytes as Uint8Array<ArrayBuffer>], { type: media.mime }), `audio.${extFor(media.mime)}`)
         form.append('model', model)
         for (const k of ['language', 'response_format', 'prompt'] as const) if (a[k] !== undefined) form.append(k, String(a[k]))
         const res = await paid(ctx, 'carpe_transcribe', undefined, {
@@ -123,7 +123,7 @@ export function audioTools(ctx: ToolContext): ToolDef[] {
         const media = await loadMedia(a.sample, { ...ctx.media, maxInputBytes: 19 * 1024 * 1024 }, 'audio/wav')
         const model = a.model ?? 'tts-chatterbox-hd'
         const form = new FormData()
-        form.append('file', new Blob([new Uint8Array(media.bytes)], { type: media.mime }), `sample.${extFor(media.mime)}`)
+        form.append('file', new Blob([media.bytes as Uint8Array<ArrayBuffer>], { type: media.mime }), `sample.${extFor(media.mime)}`)
         form.append('model', model)
         form.append('consent', 'true')
         const res = await ctx.client.request({ method: 'POST', path: '/v1/audio/voices', form, auth: 'account', retry: 'none', signal: extra.signal })

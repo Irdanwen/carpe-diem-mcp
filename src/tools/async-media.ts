@@ -84,6 +84,11 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
     const stored = storedOutput(ctx, handle, 'video')
     if (stored) return ready(stored)
     const path = job.surface === 'router' ? '/router/video/retrieve' : job.surface === 'x402' ? '/v1/x402/video/retrieve' : '/v1/video/retrieve'
+    const again = `Nothing is lost: the video stays retrievable on Carpe Diem for a while. Call carpe_video_status with job_id "${handle}" again in a few minutes.`
+    // Remote mode: /router can hand the MP4 itself over (Surplus), up to CARPE_MAX_VIDEO_BYTES: room for it is
+    // held before each retrieve, so a full store answers before anything is downloaded. /v1 and x402 answer
+    // a link (JSON), read with the JSON limit. Concurrent polls of this job by this user share one request.
+    const binary = job.surface === 'router' || !ctx.media.remote
     const r = await pollJob(ctx, extra, {
       path,
       body: { queue_id: job.queueId, ...(job.model ? { model: job.model } : {}) },
@@ -91,31 +96,37 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
       waitSeconds: wait,
       intervalMs: 5000,
       label: 'video',
-      maxBytes: ctx.cfg.maxVideoBytes,
+      maxBytes: binary ? ctx.cfg.maxVideoBytes : ctx.cfg.maxJsonBytes,
+      reserve: binary ? () => reserveOutput(ctx, ctx.cfg.maxVideoBytes, `The video was not downloaded. ${again}`) : undefined,
+      shareKey: handle,
     })
-    if (!r.done) return ok(`Video still ${r.status?.status ?? 'processing'}. Poll again with carpe_video_status job_id "${handle}".`, { job_id: handle, status: r.status?.status ?? 'processing', upstream: r.status })
-    let bytes: Buffer
-    let remote: string | undefined
-    if (r.res) bytes = r.res.body
-    else {
-      const url = (r.status?.video_url ?? r.status?.download_url ?? r.status?.url) as string | undefined
-      if (!url) return ok('Video completed but no file URL was returned.', { job_id: handle, status: 'completed', upstream: r.status })
-      remote = ctx.client.absoluteUrl(url)
-      // Hosted server: no disk, so hand the operator's short-lived link over instead of downloading it.
-      if (ctx.media.remote) return remoteLink('video', handle, job.surface, remote, 'video/mp4', 'about 10 minutes after completion')
-      // The file is served by its opaque id for ~10 minutes: download it now.
-      bytes = await download(ctx, remote, ctx.cfg.maxVideoBytes)
-    }
-    const media = { bytes, mime: sniffMime(bytes) ?? 'video/mp4' }
-    let out: Awaited<ReturnType<typeof mediaOutput>>
     try {
-      out = await mediaOutput(ctx, media, 'video', { forceSave: true, key: handle })
-    } catch (err) {
-      // A binary video (router / Surplus) is fetched again for free on the next poll.
-      if (ctx.media.remote) throw undelivered(err, `Video ${handle}`, `Nothing is lost: the video stays retrievable on Carpe Diem for a while. Call carpe_video_status with job_id "${handle}" again in a few minutes.`)
-      throw err
+      if (!r.done) return ok(`Video still ${r.status?.status ?? 'processing'}. Poll again with carpe_video_status job_id "${handle}".`, { job_id: handle, status: r.status?.status ?? 'processing', upstream: r.status })
+      let bytes: Buffer
+      let remote: string | undefined
+      if (r.res) bytes = r.res.body
+      else {
+        const url = (r.status?.video_url ?? r.status?.download_url ?? r.status?.url) as string | undefined
+        if (!url) return ok('Video completed but no file URL was returned.', { job_id: handle, status: 'completed', upstream: r.status })
+        remote = ctx.client.absoluteUrl(url)
+        // Hosted server: no disk, so hand the operator's short-lived link over instead of downloading it.
+        if (ctx.media.remote) return remoteLink('video', handle, job.surface, remote, 'video/mp4', 'about 10 minutes after completion')
+        // The file is served by its opaque id for ~10 minutes: download it now.
+        bytes = await download(ctx, remote, ctx.cfg.maxVideoBytes)
+      }
+      const media = { bytes, mime: sniffMime(bytes) ?? 'video/mp4' }
+      let out: Awaited<ReturnType<typeof mediaOutput>>
+      try {
+        out = await mediaOutput(ctx, media, 'video', { forceSave: true, reservation: r.hold, key: handle })
+      } catch (err) {
+        // A binary video (router / Surplus) is fetched again for free on the next poll.
+        if (ctx.media.remote) throw undelivered(err, `Video ${handle}`, again)
+        throw err
+      }
+      return ready(out, remote)
+    } finally {
+      r.hold?.release()
     }
-    return ready(out, remote)
   }
 
   const musicStatus = async (handle: string, wait: number, extra: ToolExtra): Promise<CallToolResult> => {
@@ -137,6 +148,8 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
       label: 'music',
       // A Carpe-served track is handed over only once: room for it is held before each retrieve (remote mode).
       reserve: () => reserveOutput(ctx, ctx.cfg.maxMediaBytes, `The track was not fetched, so nothing is lost: call carpe_music_status with job_id "${handle}" again in a few minutes.`),
+      // Two polls at once would otherwise claim it twice: the second would get JOB_NOT_FOUND.
+      shareKey: handle,
     })
     try {
       if (!r.done) return ok(`Music still ${r.status?.status ?? 'processing'}. Poll again with carpe_music_status job_id "${handle}".`, { job_id: handle, status: r.status?.status ?? 'processing', upstream: r.status })

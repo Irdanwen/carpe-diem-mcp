@@ -14,12 +14,16 @@
  * - Reservations: a one-shot paid call (TTS, synchronous image, music
  *   retrieve) reserves room for its largest possible output BEFORE the call is
  *   made, so a full store refuses the call instead of losing what was paid.
+ *   A router video retrieve reserves its largest size too, before downloading.
  *   The budget therefore also bounds the output buffers in flight.
+ * - Concurrent retrieves of the same job by the same user share one request
+ *   (`flights`): one download, one reservation.
  * - Ids never appear in logs.
  */
 import { randomBytes } from 'node:crypto'
 import { LocalRefusal } from '../errors.js'
 import { extFor, type LoadedMedia } from '../media.js'
+import { SingleFlight } from './single-flight.js'
 
 export const MEDIA_TTL_MS = 60 * 60 * 1000
 
@@ -63,6 +67,8 @@ export const ID_RE = /^[A-Za-z0-9_-]{22}$/
 const SAFE_MIME = /^(image\/(png|jpeg|webp|gif)|audio\/[a-z0-9.+-]{1,40}|video\/[a-z0-9.+-]{1,40})$/
 
 export class MediaStore {
+  /** Retrieves of a job in flight, per user: concurrent polls of the same job share one download. */
+  readonly flights = new SingleFlight()
   private readonly items = new Map<string, Item>()
   /** owner + key → id. */
   private readonly keys = new Map<string, string>()

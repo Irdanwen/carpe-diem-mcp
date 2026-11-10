@@ -20,6 +20,7 @@ import { createRemoteApp, type RemoteApp } from '../src/transports/remote.js'
 import { startIssuer, type MintOptions, type TestIssuer } from './helpers/issuer.js'
 import { BIG_MP3, GIANT_PNG, KEY, MP4, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
 import { MediaStore } from '../src/remote/media-store.js'
+import { countJsonValues } from '../src/remote/json-values.js'
 import { subHasher } from '../src/remote/log.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -431,6 +432,86 @@ describe('robustness', () => {
     }
   })
 
+  test('JSON values are counted outside strings, escapes included', () => {
+    const count = (s: string, stop?: number) => countJsonValues(Buffer.from(s), stop)
+    assert.equal(count('{}'), 1)
+    assert.equal(count('[1,2,3]'), 3)
+    assert.equal(count('{"a":[{},{}],"b":1}'), 6)
+    assert.equal(count('{"a":"{[,,,]}"}'), 1, 'inside a string: nothing')
+    assert.equal(count('["x\\"[,{",1]'), 2, 'an escaped quote does not end the string')
+    assert.equal(count('["x\\\\",[1]]'), 3, 'an escaped backslash does: the quote after it ends the string')
+    assert.equal(count('["\\\\\\"[,"]'), 1)
+    assert.equal(count('["é,ü",{"€":[]}]'), 4, 'UTF-8 bytes never look like structure')
+    assert.equal(count('["unterminated, [, {'), 1)
+    assert.equal(count('[' + '{},'.repeat(1000) + '{}]', 10), 11, 'stops as soon as the limit is passed')
+    assert.equal(count(JSON.stringify({ audio: 'data:audio/mpeg;base64,' + 'QUJD'.repeat(1000) })), 1)
+  })
+
+  test('a body of millions of tiny values is refused before JSON.parse (413); a 30 MB data: URI still goes through', async () => {
+    const r = await startRemote()
+    const parse = JSON.parse
+    const parsed: number[] = []
+    JSON.parse = ((text: string, reviver?: any) => {
+      if (typeof text === 'string' && text.length > 1_000_000) parsed.push(text.length)
+      return parse(text, reviver)
+    }) as typeof JSON.parse
+    try {
+      const t = await tokenFor(r, { sub: 'bomber' })
+      const sid = await (async () => {
+        const res = await rpc(r, t, INIT)
+        await res.text()
+        return res.headers.get('mcp-session-id')!
+      })()
+      const post = (body: string) =>
+        fetch(`${r.url}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: ACCEPT, 'mcp-protocol-version': '2025-06-18', authorization: `Bearer ${t}`, 'mcp-session-id': sid },
+          body,
+        })
+      // ~13.9 million empty objects in 41.7 MB: under the byte limit, ~850 MiB of heap once parsed.
+      const bomb = '[' + '{},'.repeat(13_900_000) + '{}]'
+      assert.ok(bomb.length < 40 * 1024 * 1024)
+      const refused = await post(bomb)
+      assert.equal(refused.status, 413)
+      assert.match(((await refused.json()) as any).error.message, /too many JSON values \(at most 100000\)/)
+      assert.deepEqual(parsed, [], 'never handed to JSON.parse')
+      assert.deepEqual(await (await fetch(`${r.url}/health`)).json(), { ok: true })
+
+      // A media input is one long string: a single value, whatever its size.
+      const uri = 'data:audio/mpeg;base64,' + Buffer.alloc(22 * 1024 * 1024, 7).toString('base64')
+      const big = await post(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'ping', params: { pad: uri } }))
+      assert.equal(big.status, 200)
+      await big.text()
+      assert.equal(parsed.length, 1, 'parsed')
+      assert.ok(parsed[0]! > 30_000_000)
+    } finally {
+      JSON.parse = parse
+      await r.close()
+    }
+  })
+
+  test('the value limit is configurable; a parse error still answers -32700 without echoing the body', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_JSON_VALUES: '100' })
+    try {
+      const t = await tokenFor(r, { sub: 'counted' })
+      const send = (body: string) =>
+        fetch(`${r.url}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, 'mcp-protocol-version': '2025-06-18', authorization: `Bearer ${t}` }, body })
+      const many = await send(JSON.stringify({ ...INIT, params: { ...INIT.params, pad: Array.from({ length: 200 }, (_, i) => i) } }))
+      assert.equal(many.status, 413)
+      await many.text()
+      const ok = await send(JSON.stringify(INIT))
+      assert.equal(ok.status, 200)
+      await ok.text()
+      const bad = await send('{"jsonrpc":"2.0","secret-in-body":')
+      assert.equal(bad.status, 400)
+      const text = await bad.text()
+      assert.deepEqual(JSON.parse(text), { jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null })
+      assert.equal((await send('"just a string"')).status, 400, 'only an object or an array at the top')
+    } finally {
+      await r.close()
+    }
+  })
+
   test('the built CLI survives a [null] body', async () => {
     const cli = join(root, 'dist', 'cli.js')
     const probe = createServer()
@@ -575,6 +656,39 @@ describe('rate and memory', () => {
     }
   })
 
+  test('concurrency counts each tools/call of a batch; notifications (cancel) are never refused by it', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_INFLIGHT_PER_USER: '2' })
+    try {
+      const a = await tokenFor(r, { sub: 'batch-calls' })
+      const sa = await session(r, a)
+      const slowBatch = (n: number, from = 20) => Array.from({ length: n }, (_, i) => ({ ...slowCall, id: from + i }))
+      assert.equal((await rpc(r, a, slowBatch(3), sa)).status, 400, 'three tool calls can never fit under 2')
+      // Two calls that would poll for 30 s.
+      const long = (id: number) => toolCall('carpe_video_status', { job_id: 'v1:video:slow-vid:m', wait_seconds: 30 })
+      const started = Date.now()
+      const two = rpc(r, a, [{ ...long(20), id: 20 }, { ...long(21), id: 21 }], sa)
+      await new Promise((res) => setTimeout(res, 150))
+      const busy = await rpc(r, a, { ...slowCall, id: 30 }, sa)
+      assert.equal(busy.status, 429, 'the batch holds both slots')
+      await busy.text()
+      // At the cap, cancellations (notifications: no id) still go through.
+      for (const requestId of [20, 21]) {
+        const cancel = await rpc(r, a, { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId, reason: 'user' } }, sa)
+        assert.equal(cancel.status, 202)
+      }
+      // The SDK answers neither: the POST is ended by the server once both are cancelled, freeing the slots.
+      const done = await two
+      assert.equal(done.status, 200)
+      await done.text()
+      assert.ok(Date.now() - started < 5000, 'ended at the cancellation, not after the 30 s wait')
+      const after = await rpc(r, a, slowBatch(2, 40), sa)
+      assert.equal(after.status, 200, 'both slots freed')
+      await after.text()
+    } finally {
+      await r.close()
+    }
+  })
+
   test('request bodies share a global byte budget counted from Content-Length (503 + Retry-After); no Content-Length counts as the maximum', async () => {
     const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '40' })
     try {
@@ -673,7 +787,7 @@ describe('rate and memory', () => {
     const d = loadRemoteConfig({})
     assert.equal(d.maxSessions, 200)
     assert.equal(d.maxInflightPerUser, 4)
-    assert.equal(d.bodyBudgetBytes, 128 * 1024 * 1024)
+    assert.equal(d.bodyBudgetBytes, 64 * 1024 * 1024)
     assert.equal(d.bodyBudgetPerUserBytes, 48 * 1024 * 1024)
     assert.equal(d.bodyTimeoutMs, 30_000)
     assert.equal(d.mediaStorePerUserBytes, 96 * 1024 * 1024)
@@ -711,6 +825,16 @@ describe('temporary media store', () => {
       assert.equal(got.res.headers.get('x-content-type-options'), 'nosniff')
       assert.equal(got.res.headers.get('content-disposition'), 'inline; filename="tts.mp3"')
       assert.ok(got.body.equals(BIG_MP3))
+      // HEAD: the same status and headers, no body.
+      const head = await fetch(tts.structured.audio.url, { method: 'HEAD' })
+      assert.equal(head.status, 200)
+      for (const h of ['content-type', 'content-length', 'content-disposition', 'cache-control', 'x-content-type-options', 'content-security-policy']) {
+        assert.equal(head.headers.get(h), got.res.headers.get(h), h)
+      }
+      assert.equal(head.headers.get('content-length'), String(BIG_MP3.length))
+      assert.equal((await head.arrayBuffer()).byteLength, 0)
+      assert.equal((await fetch(`${r.url}/media/AAAAAAAAAAAAAAAAAAAAAA`, { method: 'HEAD' })).status, 404)
+      assert.equal((await fetch(tts.structured.audio.url, { method: 'POST' })).status, 404, 'other methods: not served')
 
       // Router video served by Surplus: the operator bills, then sends the MP4 itself.
       const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
@@ -788,8 +912,9 @@ describe('temporary media store', () => {
 
       const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
       assert.equal(vs.isError, true, 'never isError:false without the video')
-      assert.match(vs.text, /MEDIA_STORE_FULL/)
+      assert.match(vs.text, /MEDIA_STORE_FULL[\s\S]*not downloaded[\s\S]*Nothing is lost/)
       assert.ok(vs.text.includes(v.structured.job_id))
+      assert.ok(!sent('/router/video/retrieve'), 'no room for the video: it is not downloaded')
 
       const gi = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
       assert.equal(gi.isError, true)
@@ -799,12 +924,13 @@ describe('temporary media store', () => {
       assert.ok(!sent('/v1/image/generate/complete'), 'the operator keeps the undelivered image')
 
       // Room again: every job is delivered, nothing was lost.
+      // (The video first: its retrieve holds room for the largest video, the whole of this 64 MiB store.)
       r.remote.store.clear()
+      const vs2 = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs2.isError, false, vs2.text)
       const ms2 = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
       assert.equal(ms2.isError, false, ms2.text)
       assert.equal(ms2.structured.audio.storage, 'hosted_mcp')
-      const vs2 = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
-      assert.equal(vs2.isError, false, vs2.text)
       const gi2 = await call(client, 'carpe_image_status', { job_id: jobId, wait_seconds: 0 })
       assert.equal(gi2.isError, false, gi2.text)
       assert.ok(await waitFor(() => sent('/v1/image/generate/complete')))
@@ -854,6 +980,68 @@ describe('temporary media store', () => {
     } finally {
       await r.close()
     }
+  })
+
+  test('30 concurrent polls of the same router video (one batch) download it once, with one reservation', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_INFLIGHT_PER_USER: '30', CARPE_MCP_RATE_BURST: '40' })
+    try {
+      const t = await tokenFor(r, { sub: 'poll-storm' })
+      const init = await rpc(r, t, INIT)
+      await init.text()
+      const sid = init.headers.get('mcp-session-id')!
+      const job = 'router:video:rvid-slow:kling-2.5-turbo-pro-text-to-video'
+      const from = mock.calls.length
+      const batch = Array.from({ length: 30 }, (_, i) => ({ ...toolCall('carpe_video_status', { job_id: job, wait_seconds: 0 }), id: 100 + i }))
+      const res = await rpc(r, t, batch, sid)
+      assert.equal(res.status, 200)
+      const text = await res.text()
+      const results = text
+        .split('\n')
+        .filter((l) => l.startsWith('data: '))
+        .flatMap((l) => [JSON.parse(l.slice(6))].flat())
+      assert.equal(results.length, 30)
+      const urls = new Set(results.map((m: any) => m.result?.structuredContent?.video?.url))
+      assert.equal(urls.size, 1, 'one link for all')
+      assert.ok([...urls][0], text.slice(0, 300))
+      assert.ok(results.every((m: any) => !m.result.isError))
+      assert.equal(mock.calls.slice(from).filter((c) => c.path === '/router/video/retrieve').length, 1, 'downloaded once')
+      assert.equal(r.remote.store.size, 1)
+      assert.equal(r.remote.store.free, r.remote.store.maxBytes - MP4.length, 'the reservation was released')
+      assert.equal(r.remote.store.flights.size, 0)
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('single flight: callers share one run; one caller cancelling leaves the others waiting', async () => {
+    const { SingleFlight } = await import('../src/remote/single-flight.js')
+    const f = new SingleFlight()
+    let runs = 0
+    let aborted = false
+    let finish!: (v: string) => void
+    const work = (signal: AbortSignal) => {
+      runs++
+      signal.addEventListener('abort', () => (aborted = true))
+      return new Promise<string>((res) => (finish = res))
+    }
+    const c1 = new AbortController()
+    const p1 = f.run('k', work, c1.signal)
+    const p2 = f.run('k', work)
+    await new Promise((res) => setImmediate(res))
+    c1.abort()
+    await assert.rejects(p1, /Cancelled/)
+    assert.equal(aborted, false, 'another caller still waits')
+    finish('done')
+    assert.equal(await p2, 'done')
+    assert.equal(runs, 1)
+    // Everyone gone: the run is aborted, and the next caller starts afresh.
+    const c3 = new AbortController()
+    const p3 = f.run('k', work, c3.signal)
+    await new Promise((res) => setImmediate(res))
+    c3.abort()
+    await assert.rejects(p3, /Cancelled/)
+    assert.equal(aborted, true)
+    assert.equal(f.size, 0)
   })
 
   test('each user has a share of the store: one user at their share does not block another', async () => {
