@@ -7,13 +7,13 @@
     "source": "github"
   },
   "websiteUrl": "https://carpe-diem.xyz/docs/integrations",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "carpe-diem-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       },
