@@ -29,7 +29,8 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
 import { CarpeClient, PublicReadCache } from '../carpe-client.js'
 import { ConfigError, loadConfig, type Config } from '../config.js'
 import { MediaStore } from '../remote/media-store.js'
-import { loadRemoteConfig, MAX_BODY_BYTES, SUPPORTED_SCOPES, type RemoteConfig } from '../remote/config.js'
+import { JSON_VALUE_CHARGE_BYTES, loadRemoteConfig, MAX_BODY_BYTES, SUPPORTED_SCOPES, type RemoteConfig } from '../remote/config.js'
+import { countJsonValues } from '../remote/json-values.js'
 import { safeName, stderrLogger, subHasher, type RemoteLogger } from '../remote/log.js'
 import { REMOTE_REMOVED_TOOLS } from '../remote/policy.js'
 import { buildRemoteServer, remoteToolScopes, type RemoteMcp } from '../remote/session.js'
@@ -205,41 +206,38 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     req?.on('aborted', once)
   }
 
-  // Per-user concurrency: POSTs being processed (a tool call can last minutes). The GET event stream is not counted.
-  const inflight = new Map<string, number>()
-  const concurrency = (req: Request, res: Response, next: NextFunction) => {
-    const sub = subOf(req)
-    const n = inflight.get(sub) ?? 0
-    if (n >= rc.maxInflightPerUser) {
-      return void rpcError(res, 429, `Too many requests in progress for this account (at most ${rc.maxInflightPerUser}); wait for one to finish.`, { 'Retry-After': '2' })
-    }
-    inflight.set(sub, n + 1)
-    onDone(res, () => {
-      const m = (inflight.get(sub) ?? 1) - 1
-      if (m > 0) inflight.set(sub, m)
-      else inflight.delete(sub)
-    })
-    next()
-  }
-
   // Budget of request-body bytes held in memory (parsing, then the call), counted from Content-Length
-  // BEFORE parsing; a body without Content-Length counts as the per-request maximum. Global (503), and
-  // per user (429) so one account cannot hold all of it. A body not fully received in time is cut (408):
-  // a stalled upload frees its bytes quickly.
+  // BEFORE parsing; a body without Content-Length, or compressed (it is inflated before parsing), counts as
+  // the per-request maximum. Global (503), and per user (429) so one account cannot hold all of it. A body
+  // not fully received in time is cut (408): a stalled upload frees its bytes quickly. Once the body is
+  // read, its JSON values are charged on top (see parseBody).
   let bodyBytes = 0
   const bodyByUser = new Map<string, number>()
   const bodyBudget = (req: Request, res: Response, next: NextFunction) => {
     const sub = subOf(req)
     const declared = Number(req.headers['content-length'])
-    const n = req.headers['content-length'] !== undefined && Number.isFinite(declared) && declared >= 0 ? declared : MAX_BODY_BYTES
-    if (n > MAX_BODY_BYTES) return void rpcError(res, 413, 'Request body too large.')
-    const mine = bodyByUser.get(sub) ?? 0
-    if (mine + n > rc.bodyBudgetPerUserBytes) {
-      return void rpcError(res, 429, 'Too much request data in progress for this account; wait for your other requests to finish.', { 'Retry-After': '5' })
+    const encoding = String(req.headers['content-encoding'] ?? 'identity').trim().toLowerCase()
+    const known = req.headers['content-length'] !== undefined && Number.isFinite(declared) && declared >= 0 && encoding === 'identity'
+    if (req.headers['content-length'] !== undefined && declared > MAX_BODY_BYTES) return void rpcError(res, 413, 'Request body too large.')
+    let n = 0
+    /** Charge `more` bytes to this request; false (and the answer sent) when the budget has no room. */
+    const charge = (more: number): boolean => {
+      const mine = bodyByUser.get(sub) ?? 0
+      if (mine + more > rc.bodyBudgetPerUserBytes) {
+        rpcError(res, 429, 'Too much request data in progress for this account; wait for your other requests to finish.', { 'Retry-After': '5' })
+        return false
+      }
+      if (bodyBytes + more > rc.bodyBudgetBytes) {
+        rpcError(res, 503, 'The server is busy with other large requests; retry shortly.', { 'Retry-After': '5' })
+        return false
+      }
+      bodyBytes += more
+      bodyByUser.set(sub, mine + more)
+      n += more
+      return true
     }
-    if (bodyBytes + n > rc.bodyBudgetBytes) return void rpcError(res, 503, 'The server is busy with other large requests; retry shortly.', { 'Retry-After': '5' })
-    bodyBytes += n
-    bodyByUser.set(sub, mine + n)
+    if (!charge(known ? declared : MAX_BODY_BYTES)) return
+    res.locals.chargeBody = charge
     const deadline = setTimeout(() => {
       if (req.complete) return
       if (!res.headersSent) {
@@ -263,8 +261,54 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     next()
   }
 
-  // Bodies are parsed only after authentication. A parse error is answered without echoing (or logging) the body.
-  const json = express.json({ limit: MAX_BODY_BYTES })
+  // Bodies are read only after authentication and within the budget, as raw bytes (a compressed body is
+  // inflated, up to the same limit). Not JSON: left to the transport, which answers 415.
+  const readBody = express.raw({ type: 'application/json', limit: MAX_BODY_BYTES })
+
+  const parseError = (res: Response) => void res.status(400).json({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null })
+
+  // What a body costs once parsed is its number of values, not its size (see remote/json-values.ts): they
+  // are counted first, and a body with too many is refused (413) without ever reaching JSON.parse. The
+  // values are then charged to the body budget on top of the bytes, so a body of many small values costs
+  // what it will hold. Only an object or an array is accepted at the top (as express.json's strict mode).
+  // A parse error is answered without echoing (or logging) the body.
+  const parseBody = (req: Request, res: Response, next: NextFunction) => {
+    if (!Buffer.isBuffer(req.body)) return next()
+    const raw: Buffer = req.body
+    req.body = undefined
+    const charset = /;\s*charset\s*=\s*"?([^";\s]+)/i.exec(req.headers['content-type'] ?? '')?.[1]
+    if (charset && !/^utf-?8$/i.test(charset)) return void rpcError(res, 415, 'Unsupported charset: JSON bodies are UTF-8.')
+    const values = countJsonValues(raw, rc.maxJsonValues)
+    if (values > rc.maxJsonValues) return void rpcError(res, 413, `Request body has too many JSON values (at most ${rc.maxJsonValues}).`)
+    const charge = res.locals.chargeBody as ((more: number) => boolean) | undefined
+    if (charge && !charge(values * JSON_VALUE_CHARGE_BYTES)) return
+    let i = 0
+    while (i < raw.length && (raw[i] === 0x20 || raw[i] === 0x09 || raw[i] === 0x0a || raw[i] === 0x0d)) i++
+    if (raw[i] !== 0x7b && raw[i] !== 0x5b) return parseError(res)
+    try {
+      req.body = JSON.parse(raw.toString('utf8'))
+    } catch {
+      return parseError(res)
+    }
+    next()
+  }
+
+  // Per-user concurrency: POSTs being processed (a tool call can last minutes). The GET event stream is not counted.
+  const inflight = new Map<string, number>()
+  const concurrency = (req: Request, res: Response, next: NextFunction) => {
+    const sub = subOf(req)
+    const n = inflight.get(sub) ?? 0
+    if (n >= rc.maxInflightPerUser) {
+      return void rpcError(res, 429, `Too many requests in progress for this account (at most ${rc.maxInflightPerUser}); wait for one to finish.`, { 'Retry-After': '2' })
+    }
+    inflight.set(sub, n + 1)
+    onDone(res, () => {
+      const m = (inflight.get(sub) ?? 1) - 1
+      if (m > 0) inflight.set(sub, m)
+      else inflight.delete(sub)
+    })
+    next()
+  }
 
   // A JSON-RPC batch counts one request per message against the user's bucket (the first was taken before
   // parsing). A batch larger than the burst could never pass: refused outright.
@@ -351,7 +395,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
     s.transport.close().catch(() => undefined)
   }
 
-  app.post('/mcp', access, originCheck, bearer, rateLimit, concurrency, bodyBudget, json, batchCost, handled(async (req, res) => {
+  app.post('/mcp', access, originCheck, bearer, rateLimit, concurrency, bodyBudget, readBody, parseBody, batchCost, handled(async (req, res) => {
     const existing = sessionFor(req, res)
     if (existing === null) return
     if (!scopeChallenge(req, res)) return
@@ -407,7 +451,7 @@ export function createRemoteApp(opts: RemoteAppOptions = {}): RemoteApp {
   app.use((err: { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return
     if (err?.type === 'entity.too.large') return void rpcError(res, 413, 'Request body too large.')
-    if (err?.type === 'entity.parse.failed') return void res.status(400).json({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null })
+    if (err?.type === 'entity.parse.failed') return parseError(res)
     rpcError(res, err?.status && err.status >= 400 && err.status < 500 ? err.status : 500, 'Request failed.')
   })
 

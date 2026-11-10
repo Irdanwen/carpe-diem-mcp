@@ -20,6 +20,7 @@ import { createRemoteApp, type RemoteApp } from '../src/transports/remote.js'
 import { startIssuer, type MintOptions, type TestIssuer } from './helpers/issuer.js'
 import { BIG_MP3, GIANT_PNG, KEY, MP4, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
 import { MediaStore } from '../src/remote/media-store.js'
+import { countJsonValues } from '../src/remote/json-values.js'
 import { subHasher } from '../src/remote/log.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -426,6 +427,86 @@ describe('robustness', () => {
       assert.ok((await client.listTools()).tools.length > 0, 'the session still works')
       assert.ok(r.logs.some((e) => e.event === 'request' && e.status === 400))
       await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('JSON values are counted outside strings, escapes included', () => {
+    const count = (s: string, stop?: number) => countJsonValues(Buffer.from(s), stop)
+    assert.equal(count('{}'), 1)
+    assert.equal(count('[1,2,3]'), 3)
+    assert.equal(count('{"a":[{},{}],"b":1}'), 6)
+    assert.equal(count('{"a":"{[,,,]}"}'), 1, 'inside a string: nothing')
+    assert.equal(count('["x\\"[,{",1]'), 2, 'an escaped quote does not end the string')
+    assert.equal(count('["x\\\\",[1]]'), 3, 'an escaped backslash does: the quote after it ends the string')
+    assert.equal(count('["\\\\\\"[,"]'), 1)
+    assert.equal(count('["é,ü",{"€":[]}]'), 4, 'UTF-8 bytes never look like structure')
+    assert.equal(count('["unterminated, [, {'), 1)
+    assert.equal(count('[' + '{},'.repeat(1000) + '{}]', 10), 11, 'stops as soon as the limit is passed')
+    assert.equal(count(JSON.stringify({ audio: 'data:audio/mpeg;base64,' + 'QUJD'.repeat(1000) })), 1)
+  })
+
+  test('a body of millions of tiny values is refused before JSON.parse (413); a 30 MB data: URI still goes through', async () => {
+    const r = await startRemote()
+    const parse = JSON.parse
+    const parsed: number[] = []
+    JSON.parse = ((text: string, reviver?: any) => {
+      if (typeof text === 'string' && text.length > 1_000_000) parsed.push(text.length)
+      return parse(text, reviver)
+    }) as typeof JSON.parse
+    try {
+      const t = await tokenFor(r, { sub: 'bomber' })
+      const sid = await (async () => {
+        const res = await rpc(r, t, INIT)
+        await res.text()
+        return res.headers.get('mcp-session-id')!
+      })()
+      const post = (body: string) =>
+        fetch(`${r.url}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: ACCEPT, 'mcp-protocol-version': '2025-06-18', authorization: `Bearer ${t}`, 'mcp-session-id': sid },
+          body,
+        })
+      // ~13.9 million empty objects in 41.7 MB: under the byte limit, ~850 MiB of heap once parsed.
+      const bomb = '[' + '{},'.repeat(13_900_000) + '{}]'
+      assert.ok(bomb.length < 40 * 1024 * 1024)
+      const refused = await post(bomb)
+      assert.equal(refused.status, 413)
+      assert.match(((await refused.json()) as any).error.message, /too many JSON values \(at most 100000\)/)
+      assert.deepEqual(parsed, [], 'never handed to JSON.parse')
+      assert.deepEqual(await (await fetch(`${r.url}/health`)).json(), { ok: true })
+
+      // A media input is one long string: a single value, whatever its size.
+      const uri = 'data:audio/mpeg;base64,' + Buffer.alloc(22 * 1024 * 1024, 7).toString('base64')
+      const big = await post(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'ping', params: { pad: uri } }))
+      assert.equal(big.status, 200)
+      await big.text()
+      assert.equal(parsed.length, 1, 'parsed')
+      assert.ok(parsed[0]! > 30_000_000)
+    } finally {
+      JSON.parse = parse
+      await r.close()
+    }
+  })
+
+  test('the value limit is configurable; a parse error still answers -32700 without echoing the body', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_JSON_VALUES: '100' })
+    try {
+      const t = await tokenFor(r, { sub: 'counted' })
+      const send = (body: string) =>
+        fetch(`${r.url}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, 'mcp-protocol-version': '2025-06-18', authorization: `Bearer ${t}` }, body })
+      const many = await send(JSON.stringify({ ...INIT, params: { ...INIT.params, pad: Array.from({ length: 200 }, (_, i) => i) } }))
+      assert.equal(many.status, 413)
+      await many.text()
+      const ok = await send(JSON.stringify(INIT))
+      assert.equal(ok.status, 200)
+      await ok.text()
+      const bad = await send('{"jsonrpc":"2.0","secret-in-body":')
+      assert.equal(bad.status, 400)
+      const text = await bad.text()
+      assert.deepEqual(JSON.parse(text), { jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null })
+      assert.equal((await send('"just a string"')).status, 400, 'only an object or an array at the top')
     } finally {
       await r.close()
     }

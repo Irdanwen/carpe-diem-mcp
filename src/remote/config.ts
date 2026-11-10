@@ -47,10 +47,19 @@ export interface RemoteConfig {
   bodyBudgetPerUserBytes: number
   /** A request body must be fully received within this delay (else 408, its bytes freed). */
   bodyTimeoutMs: number
+  /** JSON values (`{`, `[` and `,` outside strings) of one request body, counted before parsing (beyond: 413). */
+  maxJsonValues: number
 }
 
 /** Largest JSON body of one request (data: URIs of media inputs). */
 export const MAX_BODY_BYTES = 40 * 1024 * 1024
+
+/**
+ * Body-budget bytes charged per JSON value of a body, on top of its size: a parsed value holds ~64 bytes
+ * of heap and costs as much again while the request is processed, so a body of many small values counts
+ * as what it holds, at the same rate per budget byte as a media body (see deploy/README.md, "Memory").
+ */
+export const JSON_VALUE_CHARGE_BYTES = 16
 
 const LOOPBACK = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])$/i
 
@@ -106,5 +115,9 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     bodyBudgetPerUserBytes: int(env, 'CARPE_MCP_BODY_BUDGET_PER_USER_MB', 48, 40) * 1024 * 1024,
     // 40 MB in 30 s is ~1.4 MB/s: ChatGPT's and Anthropic's servers upload far faster; a stalled upload is cut.
     bodyTimeoutMs: int(env, 'CARPE_MCP_BODY_TIMEOUT_S', 30, 1) * 1000,
+    // A parsed value costs ~64 bytes of heap (an empty object; less for numbers and arrays): 100 000 is
+    // ~6 MiB, far below a large media body. A real request holds at most a few thousand (a long chat,
+    // an embeddings batch), a batch of 30 of them some tens of thousands.
+    maxJsonValues: int(env, 'CARPE_MCP_MAX_JSON_VALUES', 100_000, 100),
   }
 }
