@@ -5,6 +5,9 @@ services:
     image: carpe-diem-mcp:${MCP_VERSION:?set MCP_VERSION, e.g. 0.2.0}
     container_name: carpe-mcp
     restart: unless-stopped
+    # A minimal init as PID 1: it forwards SIGTERM to node (which, as PID 1, would ignore it and
+    # make every stop wait 10 s for SIGKILL) and reaps zombies.
+    init: true
     env_file: ./mcp.env
     # Loopback only: Nginx terminates TLS and is the only way in.
     ports:
