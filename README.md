@@ -101,7 +101,9 @@ Each result includes `route: { surface, endpoint_prefix, route_used, tee, reason
 
 The API key wins when both are set. Without either, free tools still work (catalogue, prices, quotes, markets, status).
 
-Use a **dedicated** agent wallet holding only what you are willing to spend. The private key never leaves the process and is never logged.
+Use a **dedicated** agent wallet holding only what you are willing to spend, and give it to **this server only**. The cap is computed from the permits this server signed: a permit to the Carpe escrow signed elsewhere with the same wallet is detected when it raises the allowance above what this server could have left open, but one that sets it lower looks like this server's own and goes unnoticed, and the cap can then under-count what was pulled. The private key never leaves the process and is never logged.
+
+The permit nonce and allowance are read at one pinned block; when the RPC node serving the read does not know that block yet (an RPC spread over several nodes), the read is retried once, 2 s later, and any other failure refuses to sign. When the operator's dry run of the pull fails (`X402_PREFLIGHT_FAILED`) because the USDC balance is too low, the server does not re-sign (a new permit would not help) and the error says to fund the wallet; any other dry-run failure drops the cached permit and fetches a fresh challenge, once.
 
 ## Spend guard
 
@@ -226,7 +228,7 @@ Not covered yet: the Anthropic-shaped `/v1/messages` (use `carpe_chat`), JEV dec
 Serveur MCP pour Carpe Diem. Il donne à un agent l'accès aux modèles Venice (texte, image, vidéo, voix, musique, embeddings, recherche web) via la place de marché Carpe Diem.
 
 - **Deux surfaces.** `route: "carpe"` passe par `/v1` : Carpe seul, toujours dans son TEE. `route: "router"` passe par `/router` : le marché le moins cher, éventuellement hors TEE. Chaque résultat indique le marché qui a servi la requête et si c'était un TEE.
-- **Deux modes de paiement.** Avec une clé API `cdm_`, la dépense est facturée au compte. En x402, un permit USDC est signé pour ce qui reste du budget, allowance encore ouverte comprise : l'escrow ne peut pas prélever plus que le budget au total.
+- **Deux modes de paiement.** Avec une clé API `cdm_`, la dépense est facturée au compte. En x402, un permit USDC est signé pour ce qui reste du budget, allowance encore ouverte comprise : l'escrow ne peut pas prélever plus que le budget au total. Utilisez un wallet dédié à ce serveur : un permit signé ailleurs avec le même wallet peut passer inaperçu.
 - **Garde de dépense.** Le coût est estimé gratuitement avant chaque appel. L'appel est refusé localement au-delà de `CARPE_MAX_PER_CALL_USD` ou du budget de session `CARPE_MAX_SPEND_USD`.
 - **Mode distant (aperçu).** `--remote` sert plusieurs utilisateurs derrière OAuth, pour ChatGPT et claude.ai. Le serveur ne détient aucune clé : il relaie le jeton de chaque utilisateur à l'operator, n'écrit rien sur disque et ne journalise ni prompts ni jetons. Il attend le côté Carpe Diem (OAuth pour les clients MCP, acceptation du jeton par l'operator).
 

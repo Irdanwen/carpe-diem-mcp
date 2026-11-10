@@ -104,6 +104,21 @@ const PERMIT_TYPES = {
 /** The allowance outlives the deadline once used; the deadline only bounds when the escrow may first use it. */
 const PERMIT_WINDOW_SEC = 30 * 24 * 3600
 const MAX_UNPAID_WAIT_MS = 30_000
+/** A Base block is 2 s: a lagging node has usually caught up a block later. */
+const UNKNOWN_BLOCK_RETRY_MS = 2_000
+
+/**
+ * The node does not know the requested block (yet): geth/op-geth "header not found", reth / erigon
+ * "block not found", nethermind "Block … could not be found", viem's BlockNotFoundError. Looked for in the
+ * error, its details and its causes.
+ */
+export function isUnknownBlock(err: unknown): boolean {
+  const re = /header not found|unknown block|block not found|BlockNotFound|block\b[^.]{0,80}\bcould not be found/i
+  for (let e = err as { message?: unknown; details?: unknown; shortMessage?: unknown; name?: unknown; cause?: unknown } | undefined, i = 0; e && i < 8; e = e.cause as typeof e, i++) {
+    if ([e.name, e.message, e.details, e.shortMessage].some((s) => typeof s === 'string' && re.test(s))) return true
+  }
+  return false
+}
 
 interface PersistedState {
   address: string
@@ -344,6 +359,21 @@ export class X402Session {
     }
   }
 
+  /**
+   * The nonce and allowance are read at a pinned block. On an RPC spread over several nodes, the node
+   * serving the reads may not know that block yet: one more try after a short delay. Any other failure,
+   * or the same one twice, fails closed (nothing is signed).
+   */
+  private async readPermitState(asset: Address, owner: Address, spender: Address, chainId: number): Promise<PermitState> {
+    try {
+      return await this.deps.readPermitState(asset, owner, spender, chainId)
+    } catch (err) {
+      if (!isUnknownBlock(err)) throw err
+      await this.deps.sleep(UNKNOWN_BLOCK_RETRY_MS)
+      return this.deps.readPermitState(asset, owner, spender, chainId)
+    }
+  }
+
   async sign(acc: X402Accept): Promise<string> {
     const net = this.validateAccept(acc)
     const owner = this.account.address
@@ -359,7 +389,7 @@ export class X402Session {
         `Point CARPE_X402_RPC_URL to an RPC for ${acc.network}.`,
       )
     }
-    const state = await this.deps.readPermitState(net.usdc!, owner, net.escrow!, net.chainId)
+    const state = await this.readPermitState(net.usdc!, owner, net.escrow!, net.chainId)
     const p = this.lastPermitFor(net)
     const bound = this.ownAllowanceBound(p, state.nonce)
     if (bound !== undefined && state.allowance > bound) {
@@ -429,7 +459,10 @@ export class X402Session {
         res = await send(await this.sign(this.pickAccept(body)))
         continue
       }
-      if ((code === 'X402_INVALID' || code === 'X402_PREFLIGHT_FAILED') && this.header && !resigned) {
+      // A balance too low is not cured by a new permit (the operator checks it first, before the allowance):
+      // no re-sign, the error and its hint (fund the wallet) go back as they are.
+      const lowBalance = code === 'X402_PREFLIGHT_FAILED' && /USDC balance/i.test(String((body as { error?: unknown })?.error ?? ''))
+      if ((code === 'X402_INVALID' || code === 'X402_PREFLIGHT_FAILED') && !lowBalance && this.header && !resigned) {
         // The cached permit is spent, expired, or its nonce was consumed (the operator's preflight then
         // simulates a permit that can no longer apply): fetch a fresh challenge, once.
         this.header = undefined

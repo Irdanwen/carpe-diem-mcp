@@ -21,7 +21,7 @@ import { recoverTypedDataAddress, type Address } from 'viem'
 import { generatePrivateKey } from 'viem/accounts'
 import { loadConfig } from '../src/config.js'
 import { CarpeResponse } from '../src/carpe-client.js'
-import { X402Session, type X402Deps } from '../src/x402/session.js'
+import { X402Session, x402ErrorFrom, type X402Deps } from '../src/x402/session.js'
 
 const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address
 const ESCROW = '0x15917768b31CB1DC61d9d858f2419BF45044005d' as Address
@@ -313,4 +313,74 @@ test('x402 settlement: a permit never applied does not count as spent; re-signin
   assert.equal(decode(h1).nonce, '0')
   assert.equal(decode(h2).nonce, '0')
   assert.equal(decode(h2).value, '1000000')
+})
+
+test('x402 settlement: a pinned-block read the node cannot serve yet is retried once; anything else fails closed', async () => {
+  const flaky = (failures: Error[]) => {
+    const chain = new Chain()
+    const slept: number[] = []
+    const base = chain.deps()
+    const deps: X402Deps = {
+      ...base,
+      readPermitState: async (...args) => {
+        const e = failures.shift()
+        if (e) {
+          chain.reads++
+          throw e
+        }
+        return base.readPermitState!(...args)
+      },
+      sleep: async (ms) => void slept.push(ms),
+    }
+    const s = new X402Session(loadConfig({ CARPE_X402_PRIVATE_KEY: generatePrivateKey(), CARPE_X402_BUDGET_USD: '1' }), { stateDir: null, ...deps })
+    return { chain, s, slept }
+  }
+  // geth: "header not found", wrapped by viem as the cause of a contract-call error.
+  const lagging = new Error('The contract function "nonces" returned an error.', { cause: new Error('header not found') })
+  const a = flaky([lagging])
+  assert.equal(decode(await a.s.sign(accept(1000n))).value, '1000000')
+  assert.equal(a.chain.reads, 2)
+  assert.deepEqual(a.slept, [2000])
+
+  const b = flaky([new Error('block not found'), new Error('block not found')])
+  await assert.rejects(b.s.sign(accept(1000n)), /block not found/, 'twice: fails closed')
+  assert.equal(b.chain.reads, 2)
+
+  const c = flaky([new Error('execution reverted')])
+  await assert.rejects(c.s.sign(accept(1000n)), /execution reverted/, 'any other error: no retry')
+  assert.equal(c.chain.reads, 1)
+  assert.deepEqual(c.slept, [])
+})
+
+test('x402 settlement: X402_PREFLIGHT_FAILED for an insufficient USDC balance is not re-signed; the hint says to fund the wallet', async () => {
+  const chain = new Chain()
+  const s = session('1', chain)
+  assert.equal((await s.pay(operator(chain, 250_000n))).status, 200)
+  const headers: (string | undefined)[] = []
+  // The operator's wording (settle.ts preflight), behind "Payment preflight failed: ".
+  const poor = async (h?: string) => {
+    headers.push(h)
+    return res(402, { code: 'X402_PREFLIGHT_FAILED', error: 'Payment preflight failed: insufficient USDC balance (have 1000, need 250000)' })
+  }
+  const r = await s.pay(poor)
+  assert.equal(r.status, 402)
+  assert.equal(headers.length, 1, 'sent once, with the cached permit: no fresh challenge, no new signature')
+  assert.ok(headers[0])
+  assert.equal((await s.status()).permit_signed, true, 'the cached permit is kept')
+  const err = x402ErrorFrom(r)
+  assert.equal(err.code, 'X402_PREFLIGHT_FAILED')
+  assert.match(String(err.hint), /send USDC/)
+
+  // Any other preflight failure (the allowance) still drops the permit and fetches a fresh challenge once
+  // (here the re-sign is then refused locally: the 0.75 still open fills what is left of the budget).
+  const sent: (string | undefined)[] = []
+  const short = async (h?: string) => {
+    sent.push(h)
+    if (!h) return res(402, { x402Version: 1, accepts: [accept(250_000n)] })
+    return res(402, { code: 'X402_PREFLIGHT_FAILED', error: 'Payment preflight failed: ERC20: transfer amount exceeds allowance' })
+  }
+  await assert.rejects(s.pay(short), isCode('X402_BUDGET_EXHAUSTED'))
+  assert.equal(sent.length, 2, 'the cached permit, then a fresh challenge')
+  assert.ok(sent[0])
+  assert.equal(sent[1], undefined)
 })
