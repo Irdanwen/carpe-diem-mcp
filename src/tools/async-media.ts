@@ -3,7 +3,7 @@ import { z } from 'zod'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { CarpeError, LocalRefusal } from '../errors.js'
 import { checkPassThroughUrl, loadMedia, sniffMime, toDataUri } from '../media.js'
-import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, routeInfo, safe, surfaceOf, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
+import { costInfo, decodeJob, encodeJob, mediaOutput, ok, paid, reserveOutput, routeInfo, safe, storedOutput, surfaceOf, undelivered, type JobSurface, type ToolContext, type ToolDef, type ToolExtra } from './context.js'
 import { pollJob } from './jobs.js'
 
 const ROUTE_MEDIA = z
@@ -56,7 +56,7 @@ async function resolveMediaField(ctx: ToolContext, v: unknown, maxBytes: number)
 
 /** Remote mode: a finished file stays on the operator; the user gets its temporary link. */
 function remoteLink(kind: 'video' | 'music', handle: string, surface: JobSurface, url: string, mime: string, expires: string): CallToolResult {
-  const note = 'Temporary link served by Carpe Diem: open or download it soon. Longer-lived storage is not available yet on the hosted server.'
+  const note = 'Temporary link served by Carpe Diem: open or download it soon.'
   return ok(
     `${kind === 'video' ? 'Video' : 'Music'} ready: ${url}\nExpires ${expires}. ${note}`,
     { job_id: handle, status: 'completed', [kind === 'video' ? 'video' : 'audio']: { url, mime_type: mime, expires, note }, remote_url: url, surface },
@@ -72,6 +72,17 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
 
   const videoStatus = async (handle: string, wait: number, extra: ToolExtra): Promise<CallToolResult> => {
     const job = decodeJob(handle, 'video')
+    const ready = (out: Awaited<ReturnType<typeof mediaOutput>>, remote?: string) => {
+      const where = out.info.file ?? `${out.info.url}${out.info.expires_at ? `\nTemporary link, expires ${out.info.expires_at} (one hour): download it before.` : ''}`
+      return ok(
+        `Video ready: ${where}${remote ? `\nRemote copy (expires ~10 min after completion): ${remote}` : ''}`,
+        { job_id: handle, status: 'completed', video: out.info, ...(remote ? { remote_url: remote } : {}), surface: job.surface },
+        out.content,
+      )
+    }
+    // Remote mode: already stored for this user (the same job polled again): the same link, no new copy.
+    const stored = storedOutput(ctx, handle, 'video')
+    if (stored) return ready(stored)
     const path = job.surface === 'router' ? '/router/video/retrieve' : job.surface === 'x402' ? '/v1/x402/video/retrieve' : '/v1/video/retrieve'
     const r = await pollJob(ctx, extra, {
       path,
@@ -96,17 +107,26 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
       bytes = await download(ctx, remote, ctx.cfg.maxVideoBytes)
     }
     const media = { bytes, mime: sniffMime(bytes) ?? 'video/mp4' }
-    const out = await mediaOutput(ctx, media, 'video', { forceSave: true })
-    const where = out.info.file ?? out.info.note
-    return ok(
-      `Video ready: ${where}${remote ? `\nRemote copy (expires ~10 min after completion): ${remote}` : ''}`,
-      { job_id: handle, status: 'completed', video: out.info, ...(remote ? { remote_url: remote } : {}), surface: job.surface },
-      out.content,
-    )
+    let out: Awaited<ReturnType<typeof mediaOutput>>
+    try {
+      out = await mediaOutput(ctx, media, 'video', { forceSave: true, key: handle })
+    } catch (err) {
+      // A binary video (router / Surplus) is fetched again for free on the next poll.
+      if (ctx.media.remote) throw undelivered(err, `Video ${handle}`, `Nothing is lost: the video stays retrievable on Carpe Diem for a while. Call carpe_video_status with job_id "${handle}" again in a few minutes.`)
+      throw err
+    }
+    return ready(out, remote)
   }
 
   const musicStatus = async (handle: string, wait: number, extra: ToolExtra): Promise<CallToolResult> => {
     const job = decodeJob(handle, 'music')
+    const ready = (out: Awaited<ReturnType<typeof mediaOutput>>) => {
+      const where = out.info.file ? `: ${out.info.file}` : out.info.inline ? ' (inline audio)' : `: ${out.info.url}\nTemporary link, expires ${out.info.expires_at} (one hour): download it before.`
+      return ok(`Music ready${where}`, { job_id: handle, status: 'completed', audio: out.info, surface: job.surface }, out.content)
+    }
+    // Remote mode: already stored for this user: the same link (the operator would answer JOB_NOT_FOUND by now).
+    const stored = storedOutput(ctx, handle, 'music')
+    if (stored) return ready(stored)
     const path = job.surface === 'router' ? '/router/audio/music/retrieve' : job.surface === 'x402' ? '/v1/x402/audio/music/retrieve' : '/v1/audio/music/retrieve'
     const r = await pollJob(ctx, extra, {
       path,
@@ -115,19 +135,31 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
       waitSeconds: wait,
       intervalMs: 4000,
       label: 'music',
+      // A Carpe-served track is handed over only once: room for it is held before each retrieve (remote mode).
+      reserve: () => reserveOutput(ctx, ctx.cfg.maxMediaBytes, `The track was not fetched, so nothing is lost: call carpe_music_status with job_id "${handle}" again in a few minutes.`),
     })
-    if (!r.done) return ok(`Music still ${r.status?.status ?? 'processing'}. Poll again with carpe_music_status job_id "${handle}".`, { job_id: handle, status: r.status?.status ?? 'processing', upstream: r.status })
-    let bytes: Buffer | undefined = r.res?.body
-    if (!bytes) {
-      const url = (r.status?.audio_url ?? r.status?.download_url ?? r.status?.url) as string | undefined
-      if (!url) return ok('Music completed but no audio was returned.', { job_id: handle, status: 'completed', upstream: r.status })
-      if (ctx.media.remote) return remoteLink('music', handle, job.surface, ctx.client.absoluteUrl(url), 'audio/mpeg', 'set by the operator (short-lived)')
-      bytes = await download(ctx, ctx.client.absoluteUrl(url), ctx.cfg.maxMediaBytes)
+    try {
+      if (!r.done) return ok(`Music still ${r.status?.status ?? 'processing'}. Poll again with carpe_music_status job_id "${handle}".`, { job_id: handle, status: r.status?.status ?? 'processing', upstream: r.status })
+      let bytes: Buffer | undefined = r.res?.body
+      if (!bytes) {
+        const url = (r.status?.audio_url ?? r.status?.download_url ?? r.status?.url) as string | undefined
+        if (!url) return ok('Music completed but no audio was returned.', { job_id: handle, status: 'completed', upstream: r.status })
+        if (ctx.media.remote) return remoteLink('music', handle, job.surface, ctx.client.absoluteUrl(url), 'audio/mpeg', 'set by the operator (short-lived)')
+        bytes = await download(ctx, ctx.client.absoluteUrl(url), ctx.cfg.maxMediaBytes)
+      }
+      const media = { bytes, mime: sniffMime(bytes) ?? r.res?.contentType ?? 'audio/mpeg' }
+      // On /v1 a finished track can be claimed only once: always keep a copy on disk (remote mode: inline, or the media store).
+      let out: Awaited<ReturnType<typeof mediaOutput>>
+      try {
+        out = await mediaOutput(ctx, media, 'music', { forceSave: true, reservation: r.hold, key: handle })
+      } catch (err) {
+        if (ctx.media.remote) throw undelivered(err, `Music ${handle}`, undefined)
+        throw err
+      }
+      return ready(out)
+    } finally {
+      r.hold?.release()
     }
-    const media = { bytes, mime: sniffMime(bytes) ?? r.res?.contentType ?? 'audio/mpeg' }
-    // On /v1 a finished track can be claimed only once: always keep a copy on disk (inline only in remote mode).
-    const out = await mediaOutput(ctx, media, 'music', { forceSave: true })
-    return ok(`Music ready${out.info.file ? `: ${out.info.file}` : out.info.inline ? ' (inline audio)' : `: ${out.info.note}`}`, { job_id: handle, status: 'completed', audio: out.info, surface: job.surface }, out.content)
   }
 
   return [

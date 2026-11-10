@@ -25,7 +25,7 @@ export interface RemoteConfig {
   jwksUrl: string | undefined
   /** Accepted JWS algorithms (default ES256, the issuer's signing algorithm). */
   algorithms: string[]
-  /** Clock skew tolerated on exp / nbf / iat, in seconds. */
+  /** Clock skew tolerated on nbf / iat (a token from the future), in seconds. Never on exp. */
   clockToleranceSec: number
   /** Token bucket per user: sustained requests per minute and burst size. */
   ratePerMinute: number
@@ -35,7 +35,22 @@ export interface RemoteConfig {
   maxSessions: number
   /** Salt of the hashed user id written to the logs (random per process when unset). */
   logSalt: string | undefined
+  /** Byte budget of the temporary media store (outputs too large to return inline, and the room held for them). */
+  mediaStoreBytes: number
+  /** Each user's share of it (stored + reserved), so one user cannot starve the others. */
+  mediaStorePerUserBytes: number
+  /** POST /mcp requests of one user being processed at once (beyond: 429). */
+  maxInflightPerUser: number
+  /** Request-body bytes being parsed or processed, all users together (beyond: 503). */
+  bodyBudgetBytes: number
+  /** Each user's share of it (beyond: 429), so one account cannot hold the whole budget. */
+  bodyBudgetPerUserBytes: number
+  /** A request body must be fully received within this delay (else 408, its bytes freed). */
+  bodyTimeoutMs: number
 }
+
+/** Largest JSON body of one request (data: URIs of media inputs). */
+export const MAX_BODY_BYTES = 40 * 1024 * 1024
 
 const LOOPBACK = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])$/i
 
@@ -77,7 +92,19 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     ratePerMinute: int(env, 'CARPE_MCP_RATE_PER_MIN', 120, 1),
     rateBurst: int(env, 'CARPE_MCP_RATE_BURST', 30, 1),
     maxSessionsPerUser: int(env, 'CARPE_MCP_MAX_SESSIONS_PER_USER', 5, 1),
-    maxSessions: int(env, 'CARPE_MCP_MAX_SESSIONS', 1000, 1),
+    // About 0.7 MiB of heap per session (an McpServer with its tools): 200 ≈ 150 MiB, see deploy/compose.yml.
+    maxSessions: int(env, 'CARPE_MCP_MAX_SESSIONS', 200, 1),
     logSalt: env.CARPE_MCP_LOG_SALT?.trim() || undefined,
+    // At least the largest single output (a 64 MiB video), so any one of them can be kept.
+    mediaStoreBytes: int(env, 'CARPE_MCP_MEDIA_STORE_MB', 256, 64) * 1024 * 1024,
+    // The largest output (64 MiB) plus a synchronous call's reservation on top of it.
+    mediaStorePerUserBytes: int(env, 'CARPE_MCP_MEDIA_STORE_PER_USER_MB', 96, 64) * 1024 * 1024,
+    maxInflightPerUser: int(env, 'CARPE_MCP_MAX_INFLIGHT_PER_USER', 4, 1),
+    // At least one request of the largest size.
+    bodyBudgetBytes: int(env, 'CARPE_MCP_BODY_BUDGET_MB', 128, 40) * 1024 * 1024,
+    // One request of the largest size and a few small ones: it takes three accounts to fill the default budget.
+    bodyBudgetPerUserBytes: int(env, 'CARPE_MCP_BODY_BUDGET_PER_USER_MB', 48, 40) * 1024 * 1024,
+    // 40 MB in 30 s is ~1.4 MB/s: ChatGPT's and Anthropic's servers upload far faster; a stalled upload is cut.
+    bodyTimeoutMs: int(env, 'CARPE_MCP_BODY_TIMEOUT_S', 30, 1) * 1000,
   }
 }

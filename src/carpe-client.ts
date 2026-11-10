@@ -193,6 +193,36 @@ function errorCodeOf(res: CarpeResponse): string | undefined {
   }
 }
 
+/**
+ * Remote mode: the public catalogue reads (models, prices, router markets),
+ * shared by every session and kept `ttlMs`. They are sent without a token, so
+ * the operator counts them all on one anonymous bucket (the server's IP): one
+ * fetch per minute instead of one per call. Concurrent misses share one fetch.
+ */
+export class PublicReadCache {
+  static readonly PATHS: ReadonlySet<string> = new Set(['/v1/models', '/router/models', '/pricing', '/router/markets'])
+  private readonly entries = new Map<string, { at: number; res: CarpeResponse }>()
+  private readonly pending = new Map<string, Promise<CarpeResponse>>()
+
+  constructor(readonly ttlMs = 60_000) {}
+
+  get(path: string, load: () => Promise<CarpeResponse>): Promise<CarpeResponse> {
+    const hit = this.entries.get(path)
+    if (hit && Date.now() - hit.at < this.ttlMs) return Promise.resolve(hit.res)
+    let p = this.pending.get(path)
+    if (!p) {
+      p = load()
+        .then((res) => {
+          this.entries.set(path, { at: Date.now(), res })
+          return res
+        })
+        .finally(() => this.pending.delete(path))
+      this.pending.set(path, p)
+    }
+    return p
+  }
+}
+
 export class CarpeClient {
   readonly mode: PaymentMode
   private readonly userAgent: string
@@ -203,6 +233,7 @@ export class CarpeClient {
     private readonly fetchImpl: FetchLike = fetch,
     private readonly userToken: BearerSource | undefined = undefined,
     private readonly onTokenRejected: TokenRejected | undefined = undefined,
+    private readonly publicCache: PublicReadCache | undefined = undefined,
   ) {
     this.mode = paymentMode(cfg)
     this.userAgent = `${cfg.serverName}/${cfg.serverVersion}`
@@ -233,6 +264,14 @@ export class CarpeClient {
   }
 
   async request(opts: RequestOptions): Promise<CarpeResponse> {
+    const anonymous = opts.auth === 'none' || (opts.auth === 'optional' && this.mode === 'oauth')
+    if (this.publicCache && anonymous && (opts.method ?? 'GET') === 'GET' && !opts.query && opts.json === undefined && PublicReadCache.PATHS.has(opts.path)) {
+      return this.publicCache.get(opts.path, () => this.uncached(opts))
+    }
+    return this.uncached(opts)
+  }
+
+  private async uncached(opts: RequestOptions): Promise<CarpeResponse> {
     const retry = opts.retry ?? (opts.auth === 'paid' ? 'paid' : 'read')
     const maxAttempts = retry === 'read' ? 3 : retry === 'paid' ? 2 : 1
     let lastErr: unknown

@@ -5,6 +5,9 @@ services:
     image: carpe-diem-mcp:${MCP_VERSION:?set MCP_VERSION, e.g. 0.2.0}
     container_name: carpe-mcp
     restart: unless-stopped
+    # A minimal init as PID 1: it forwards SIGTERM to node (which, as PID 1, would ignore it and
+    # make every stop wait 10 s for SIGKILL) and reaps zombies.
+    init: true
     env_file: ./mcp.env
     # Loopback only: Nginx terminates TLS and is the only way in.
     ports:
@@ -15,7 +18,17 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    mem_limit: 768m
+    # Memory, with the defaults (measured on 0.2.x, see deploy/README.md "Memory"):
+    #   baseline                                        ~130 MiB
+    #   sessions: 200 (CARPE_MCP_MAX_SESSIONS) × ~0.75  ~150 MiB
+    #   request bodies: 128 MB (CARPE_MCP_BODY_BUDGET_MB), ~107 MiB per 39 MB body in flight → ~320 MiB
+    #   media store: 256 MiB (CARPE_MCP_MEDIA_STORE_MB), outside the V8 heap
+    #   total ~856 MiB, under 1 GiB with ~170 MiB of headroom.
+    # The V8 heap (sessions + parsed bodies, ~430 MiB at most) is capped explicitly; the media store is not in it.
+    # Raising one of the three budgets means raising mem_limit by as much (and the heap for the first two).
+    mem_limit: 1g
+    environment:
+      NODE_OPTIONS: --max-old-space-size=576
     pids_limit: 256
     logging:
       driver: json-file

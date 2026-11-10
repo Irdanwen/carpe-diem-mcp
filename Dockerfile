@@ -1,7 +1,7 @@
 # Hosted MCP server (remote mode) — https://mcp.carpe-diem.xyz/mcp
-# Build from a release tag of this repository, never from a working copy:
-#   docker build -t carpe-diem-mcp:<version> https://github.com/Lumen-labs-ch/carpe-diem-mcp.git#v<version>
-# See deploy/README.md.
+# Build from a release's commit (checked against its tag), never from a working copy:
+#   docker build -t carpe-diem-mcp:<version> https://github.com/Lumen-labs-ch/carpe-diem-mcp.git#<commit sha>
+# See deploy/README.md ("Releases", "Install").
 
 ARG NODE_IMAGE=node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
 

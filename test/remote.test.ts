@@ -5,7 +5,7 @@
 import { after, before, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { createServer, type Server } from 'node:http'
+import { createServer, request as httpRequest, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,7 +18,9 @@ import { loadRemoteConfig } from '../src/remote/config.js'
 import { TokenBucket } from '../src/remote/users.js'
 import { createRemoteApp, type RemoteApp } from '../src/transports/remote.js'
 import { startIssuer, type MintOptions, type TestIssuer } from './helpers/issuer.js'
-import { KEY, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
+import { BIG_MP3, GIANT_PNG, KEY, MP4, startMockCarpe, type MockCarpe } from './helpers/mock-carpe.js'
+import { MediaStore } from '../src/remote/media-store.js'
+import { subHasher } from '../src/remote/log.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const ACCEPT = 'application/json, text/event-stream'
@@ -190,6 +192,10 @@ describe('discovery and token validation', () => {
       ['nbf in the future', await tokenFor(srv, { notBefore: 600 })],
       ['bad signature', await tokenFor(srv, { rogueKey: true })],
       ['garbage', 'not-a-jwt'],
+      ['typ JWT (an id_token, not an access token)', await tokenFor(srv, { typ: 'JWT' })],
+      ['no typ', await tokenFor(srv, { typ: null })],
+      ['expired 5 s ago (no skew on exp)', await tokenFor(srv, { expiresIn: -5 })],
+      ['issued 10 min in the future', await tokenFor(srv, { issuedAt: 600 })],
     ]
     for (const [label, token] of cases) {
       const res = await rpc(srv, token, INIT)
@@ -198,9 +204,19 @@ describe('discovery and token validation', () => {
       assert.match(res.headers.get('www-authenticate') ?? '', /resource_metadata="/, label)
     }
     assert.equal(mock.calls.length, before, 'no rejected token reached the operator')
-    // Small clock skew is tolerated.
-    const skewed = await tokenFor(srv, { expiresIn: -5 })
-    assert.equal((await rpc(srv, skewed, INIT)).status, 200)
+    // A small clock skew is tolerated on nbf / iat (the issuer's clock a little ahead), never on exp.
+    assert.equal((await rpc(srv, await tokenFor(srv, { notBefore: 5, issuedAt: 5 }), INIT)).status, 200)
+    assert.equal((await rpc(srv, await tokenFor(srv, { typ: 'application/at+jwt' }), INIT)).status, 200)
+  })
+
+  test('the expiry handed to the SDK is the token\'s own exp, without the skew', async () => {
+    const { JwtAccessTokenVerifier } = await import('../src/remote/token.js')
+    const v = new JwtAccessTokenVerifier(loadRemoteConfig({ CARPE_OAUTH_ISSUER: issuer.url, CARPE_MCP_PUBLIC_URL: srv.url }))
+    const t = await issuer.mint({ aud: srv.url, expiresIn: 100 })
+    const exp = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8')).exp
+    assert.equal((await v.verifyAccessToken(t)).expiresAt, exp)
+    await assert.rejects(v.verifyAccessToken(await issuer.mint({ aud: srv.url, expiresIn: 0 })), /expired/)
+    await assert.rejects(v.verifyAccessToken(await issuer.mint({ aud: srv.url, typ: 'JWT' })), /Not an access token/)
   })
 
   test('an unreachable issuer is a server error (500), never an accepted token', async () => {
@@ -383,6 +399,68 @@ describe('credentials and isolation', () => {
   })
 })
 
+describe('robustness', () => {
+  test('malformed bodies ([null], [1], "x", [{}], null in a batch) get a 4xx and the server keeps serving', async () => {
+    const r = await startRemote()
+    try {
+      const t = await tokenFor(r, { sub: 'fuzzer' })
+      const raw = (body: string, sid?: string) =>
+        fetch(`${r.url}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: ACCEPT, 'mcp-protocol-version': '2025-06-18', authorization: `Bearer ${t}`, ...(sid ? { 'mcp-session-id': sid } : {}) },
+          body,
+        })
+      for (const body of ['[null]', '[1]', '"x"', '[{}]', 'null', '[]', '[null, {"jsonrpc":"2.0","id":1,"method":"tools/call","params":null}]']) {
+        const res = await raw(body)
+        assert.ok(res.status >= 400 && res.status < 500, `${body} → ${res.status}`)
+        await res.text()
+      }
+      // Inside a live session too.
+      const { client, transport } = await connect(r, t)
+      for (const body of ['[null]', '[1]', '[{}]', '[null, {"jsonrpc":"2.0","method":"tools/call","params":{"name":null}}]']) {
+        const res = await raw(body, transport.sessionId)
+        assert.ok(res.status >= 400 && res.status < 500, `session ${body} → ${res.status}`)
+        await res.text()
+      }
+      assert.deepEqual(await (await fetch(`${r.url}/health`)).json(), { ok: true })
+      assert.ok((await client.listTools()).tools.length > 0, 'the session still works')
+      assert.ok(r.logs.some((e) => e.event === 'request' && e.status === 400))
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('the built CLI survives a [null] body', async () => {
+    const cli = join(root, 'dist', 'cli.js')
+    const probe = createServer()
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', () => r()))
+    const port = (probe.address() as AddressInfo).port
+    await new Promise<void>((r) => probe.close(() => r()))
+    const url = `http://127.0.0.1:${port}`
+    const child = spawn(process.execPath, [cli, '--remote', '--port', String(port)], {
+      env: { PATH: process.env.PATH, CARPE_TEST_BASE_URL: mock.base, CARPE_OAUTH_ISSUER: issuer.url, CARPE_MCP_PUBLIC_URL: url },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let logs = ''
+    child.stderr.on('data', (d) => (logs += d))
+    let exited = false
+    child.on('exit', () => (exited = true))
+    try {
+      for (let i = 0; i < 100 && !logs.includes('remote mode on'); i++) await new Promise((r) => setTimeout(r, 50))
+      const t = await issuer.mint({ aud: url, sub: 'cli-fuzzer' })
+      const res = await fetch(`${url}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, authorization: `Bearer ${t}` }, body: '[null]' })
+      assert.equal(res.status, 400)
+      await res.text()
+      await new Promise((r) => setTimeout(r, 100))
+      assert.equal(exited, false, 'the process is still running')
+      assert.equal((await fetch(`${url}/health`)).status, 200)
+    } finally {
+      child.kill()
+    }
+  })
+})
+
 describe('media without a disk', () => {
   test('inputs: local paths, http:// and private hosts are refused before anything is paid', async () => {
     const { client } = await connect(srv, await tokenFor(srv, { sub: 'media-in' }))
@@ -437,6 +515,414 @@ describe('media without a disk', () => {
     assert.ok(st.content.some((c) => c.type === 'resource_link' && c.uri === `${mock.base}/v1/video/file/abc123`))
     assert.ok(!mock.calls.some((c) => c.path === '/v1/video/file/abc123'), 'the server did not download the video')
     await client.close()
+  })
+})
+
+describe('rate and memory', () => {
+  const slowCall = toolCall('carpe_video_status', { job_id: 'v1:video:slow-vid:m', wait_seconds: 0 })
+  const session = async (r: Remote, t: string) => {
+    const res = await rpc(r, t, INIT)
+    await res.text()
+    return res.headers.get('mcp-session-id')!
+  }
+  /** Headers only: the server answers before reading a body, so none is sent. */
+  const headersOnly = (r: Remote, t: string, headers: Record<string, string>) =>
+    new Promise<number>((resolve, reject) => {
+      const u = new URL(`${r.url}/mcp`)
+      const req = httpRequest({ host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, authorization: `Bearer ${t}`, ...headers } }, (res) => {
+        resolve(res.statusCode ?? 0)
+        req.destroy()
+      })
+      req.on('error', (e) => (e.message.includes('socket hang up') ? undefined : reject(e)))
+      req.flushHeaders()
+    })
+
+  test('each message of a JSON-RPC batch counts against the user\'s bucket; a batch above the burst is refused', async () => {
+    const r = await startRemote({ CARPE_MCP_RATE_BURST: '5', CARPE_MCP_RATE_PER_MIN: '1' })
+    try {
+      const t = await tokenFor(r, { sub: 'batcher' })
+      const sid = await session(r, t) // 1 of 5
+      const ping = (id: number) => ({ jsonrpc: '2.0', id, method: 'ping' })
+      assert.equal((await rpc(r, t, [ping(1), ping(2), ping(3), ping(4), ping(5), ping(6)], sid)).status, 400, 'above the burst')
+      const batch = await rpc(r, t, [ping(1), ping(2), ping(3)], sid) // 1 + 2 = 3 more: 4 of 5
+      assert.notEqual(batch.status, 429)
+      await batch.text()
+      assert.equal((await rpc(r, t, [ping(7), ping(8)], sid)).status, 429, 'the batch counted three')
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('requests in progress per user are capped (429 + Retry-After); other users are not affected', async () => {
+    const r = await startRemote({ CARPE_MCP_MAX_INFLIGHT_PER_USER: '1' })
+    try {
+      const a = await tokenFor(r, { sub: 'slow-a' })
+      const sa = await session(r, a)
+      const slow = rpc(r, a, slowCall, sa)
+      await new Promise((res) => setTimeout(res, 100))
+      const busy = await rpc(r, a, { jsonrpc: '2.0', id: 9, method: 'ping' }, sa)
+      assert.equal(busy.status, 429)
+      assert.equal(busy.headers.get('retry-after'), '2')
+      const b = await tokenFor(r, { sub: 'slow-b' })
+      assert.equal((await rpc(r, b, INIT)).status, 200)
+      const done = await slow
+      assert.equal(done.status, 200)
+      await done.text()
+      const again = await rpc(r, a, { jsonrpc: '2.0', id: 10, method: 'ping' }, sa)
+      assert.equal(again.status, 200, 'the slot is freed when the response ends')
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('request bodies share a global byte budget counted from Content-Length (503 + Retry-After); no Content-Length counts as the maximum', async () => {
+    const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '40' })
+    try {
+      const a = await tokenFor(r, { sub: 'body-a' })
+      const sa = await session(r, a)
+      assert.equal(await headersOnly(r, a, { 'content-length': String(41 * 1024 * 1024) }), 413)
+      // A small call in progress holds its bytes: a body of the whole budget no longer fits.
+      const slow = rpc(r, a, slowCall, sa)
+      await new Promise((res) => setTimeout(res, 100))
+      const b = await tokenFor(r, { sub: 'body-b' })
+      assert.equal(await headersOnly(r, b, { 'content-length': String(40 * 1024 * 1024) }), 503)
+      assert.equal(await headersOnly(r, b, { 'transfer-encoding': 'chunked' }), 503)
+      const small = await rpc(r, b, INIT)
+      assert.equal(small.status, 200, 'small bodies still fit')
+      await small.text()
+      const done = await slow
+      assert.equal(done.status, 200)
+      await done.text()
+      await new Promise((res) => setTimeout(res, 50))
+      const sb = await session(r, b)
+      const big = await rpc(r, b, { jsonrpc: '2.0', id: 11, method: 'ping', params: { pad: 'A'.repeat(39 * 1024 * 1024) } }, sb)
+      assert.notEqual(big.status, 503, 'room again once the call is over')
+      await big.text()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('public catalogue reads are shared by every session for 60 s', async () => {
+    const r = await startRemote()
+    try {
+      const c1 = await connect(r, await tokenFor(r, { sub: 'cat-1' }))
+      const c2 = await connect(r, await tokenFor(r, { sub: 'cat-2' }))
+      const from = mock.calls.length
+      for (const c of [c1, c2]) {
+        assert.equal((await call(c.client, 'carpe_list_models', {})).isError, false)
+        assert.equal((await call(c.client, 'carpe_list_models', { type: 'image' })).isError, false)
+        assert.equal((await call(c.client, 'carpe_model_details', { model: 'tts-kokoro' })).isError, false)
+        await c.client.readResource({ uri: 'carpe://models' })
+      }
+      assert.equal(mock.calls.slice(from).filter((c) => c.path === '/v1/models').length, 1)
+      for (const c of [c1, c2]) await c.client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('a stalled upload is cut (408) and its bytes are freed', async () => {
+    const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '40', CARPE_MCP_BODY_TIMEOUT_S: '1' })
+    try {
+      const a = await tokenFor(r, { sub: 'trickler' })
+      const b = await tokenFor(r, { sub: 'patient' })
+      const started = Date.now()
+      const stalled = new Promise<number>((resolve, reject) => {
+        const u = new URL(`${r.url}/mcp`)
+        const req = httpRequest(
+          { host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', accept: ACCEPT, authorization: `Bearer ${a}`, 'content-length': String(40 * 1024 * 1024) } },
+          (res) => {
+            resolve(res.statusCode ?? 0)
+            req.destroy()
+          },
+        )
+        req.on('error', (e) => (/hang up|ECONNRESET|EPIPE/.test(e.message) ? undefined : reject(e)))
+        req.write('{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"' + 'A'.repeat(1024)) // …then nothing
+      })
+      await new Promise((res) => setTimeout(res, 200))
+      assert.equal(await headersOnly(r, b, { 'content-length': String(40 * 1024 * 1024) }), 503, 'held by the stalled upload')
+      assert.equal(await stalled, 408)
+      assert.ok(Date.now() - started < 3000, 'cut after the body deadline')
+      await new Promise((res) => setTimeout(res, 50))
+      // Freed: B's request is admitted now (and, sending nothing either, is cut in turn instead of refused).
+      assert.equal(await headersOnly(r, b, { 'content-length': String(40 * 1024 * 1024) }), 408)
+      assert.equal((await fetch(`${r.url}/health`)).status, 200)
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('each user has a share of the body budget: one user at their share does not block another', async () => {
+    const r = await startRemote({ CARPE_MCP_BODY_BUDGET_MB: '128', CARPE_MCP_BODY_BUDGET_PER_USER_MB: '48', CARPE_MCP_BODY_TIMEOUT_S: '1' })
+    try {
+      const a = await tokenFor(r, { sub: 'hog' })
+      const b = await tokenFor(r, { sub: 'neighbour' })
+      const big = { 'content-length': String(40 * 1024 * 1024) }
+      const first = headersOnly(r, a, big) // admitted, then cut by the deadline
+      await new Promise((res) => setTimeout(res, 100))
+      assert.equal(await headersOnly(r, a, big), 429, 'beyond the user\'s share')
+      assert.equal(await headersOnly(r, b, big), 408, 'another user is admitted (then cut: it sends no body)')
+      assert.equal(await first, 408)
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('defaults', () => {
+    const d = loadRemoteConfig({})
+    assert.equal(d.maxSessions, 200)
+    assert.equal(d.maxInflightPerUser, 4)
+    assert.equal(d.bodyBudgetBytes, 128 * 1024 * 1024)
+    assert.equal(d.bodyBudgetPerUserBytes, 48 * 1024 * 1024)
+    assert.equal(d.bodyTimeoutMs, 30_000)
+    assert.equal(d.mediaStorePerUserBytes, 96 * 1024 * 1024)
+    assert.throws(() => loadRemoteConfig({ CARPE_MCP_BODY_BUDGET_MB: '39' }), ConfigError)
+  })
+})
+
+describe('temporary media store', () => {
+  const MiB = 1024 * 1024
+  const fetchMedia = async (url: string) => {
+    const res = await fetch(url)
+    return { res, body: Buffer.from(await res.arrayBuffer()) }
+  }
+  const waitFor = async (pred: () => boolean) => {
+    for (let i = 0; i < 50 && !pred(); i++) await new Promise((r) => setTimeout(r, 20))
+    return pred()
+  }
+
+  test('outputs too large to return inline (TTS, router/Surplus video, music, queued image) come back as a /media link', async () => {
+    const r = await startRemote()
+    try {
+      const { client } = await connect(r, await tokenFor(r, { sub: 'big-outputs' }))
+      const linkRe = new RegExp(`^${r.url}/media/[A-Za-z0-9_-]{22}$`)
+
+      const tts = await call(client, 'carpe_tts', { input: 'a long text', voice: 'long', route: 'carpe' })
+      assert.equal(tts.isError, false, tts.text)
+      assert.equal(tts.structured.audio.storage, 'hosted_mcp')
+      assert.match(tts.structured.audio.url, linkRe)
+      assert.ok(tts.content.some((c) => c.type === 'resource_link' && c.uri === tts.structured.audio.url))
+      assert.ok(Date.parse(tts.structured.audio.expires_at) - Date.now() > 59 * 60_000)
+      const got = await fetchMedia(tts.structured.audio.url)
+      assert.equal(got.res.status, 200)
+      assert.equal(got.res.headers.get('content-type'), 'audio/mpeg')
+      assert.equal(got.res.headers.get('cache-control'), 'private, no-store')
+      assert.equal(got.res.headers.get('x-content-type-options'), 'nosniff')
+      assert.equal(got.res.headers.get('content-disposition'), 'inline; filename="tts.mp3"')
+      assert.ok(got.body.equals(BIG_MP3))
+
+      // Router video served by Surplus: the operator bills, then sends the MP4 itself.
+      const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
+      assert.equal(v.isError, false, v.text)
+      const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs.isError, false, vs.text)
+      assert.equal(vs.structured.video.storage, 'hosted_mcp')
+      assert.match(vs.text, /Video ready: http/)
+      const vid = await fetchMedia(vs.structured.video.url)
+      assert.equal(vid.res.headers.get('content-type'), 'video/mp4')
+      assert.ok(vid.body.equals(MP4))
+
+      // A Carpe-served track is handed over once: it is kept here.
+      mock.counters['mus-long'] = 0
+      const m = await call(client, 'carpe_music_generate', { prompt: 'jazz', model: 'long-music', route: 'carpe' })
+      assert.equal(m.isError, false, m.text)
+      const ms = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+      assert.equal(ms.isError, false, ms.text)
+      assert.equal(ms.structured.audio.storage, 'hosted_mcp')
+      assert.ok((await fetchMedia(ms.structured.audio.url)).body.equals(BIG_MP3))
+
+      // A queued image above the operator's share limit: stored here, and /complete only after delivery.
+      const from = mock.calls.length
+      const img = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
+      assert.equal(img.isError, false, img.text)
+      assert.equal(img.structured.images[0].storage, 'hosted_mcp')
+      assert.ok((await fetchMedia(img.structured.images[0].url)).body.equals(GIANT_PNG))
+      assert.ok(await waitFor(() => mock.calls.slice(from).some((c) => c.path === '/v1/image/generate/complete')))
+      assert.ok(!mock.calls.slice(from).some((c) => c.path === '/v1/image/share'), 'too large for the operator share: not even tried')
+
+      // Unknown, malformed: 404. The logs never carry a media id.
+      for (const p of ['/media/AAAAAAAAAAAAAAAAAAAAAA', '/media/short', '/media/..%2Fhealth']) {
+        const res = await fetch(`${r.url}${p}`)
+        assert.equal(res.status, 404, p)
+        assert.equal(res.headers.get('cache-control'), 'private, no-store')
+      }
+      const dump = JSON.stringify(r.logs)
+      for (const url of [tts.structured.audio.url, vs.structured.video.url, ms.structured.audio.url, img.structured.images[0].url]) {
+        assert.ok(!dump.includes(url.split('/').pop()), 'a media id reached the logs')
+      }
+      assert.ok(r.logs.some((e) => e.event === 'media' && e.status === 200 && e.bytes === BIG_MP3.length))
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('a full store refuses one-shot paid calls before paying, and a lost delivery is an error naming the job', async () => {
+    const r = await startRemote({ CARPE_MCP_MEDIA_STORE_MB: '64' })
+    try {
+      const { client } = await connect(r, await tokenFor(r, { sub: 'store-full' }))
+      mock.counters['mus-long'] = 0
+      const m = await call(client, 'carpe_music_generate', { prompt: 'jazz', model: 'long-music', route: 'carpe' })
+      const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
+      assert.equal(m.isError || v.isError, false)
+      r.remote.store.put({ bytes: Buffer.alloc(64 * MiB), mime: 'application/octet-stream' }, 'filler')
+      const from = mock.calls.length
+      const sent = (path: string) => mock.calls.slice(from).some((c) => c.path === path)
+
+      const tts = await call(client, 'carpe_tts', { input: 'x', voice: 'long', route: 'carpe' })
+      assert.equal(tts.isError, true)
+      assert.match(tts.text, /MEDIA_STORE_FULL[\s\S]*Nothing was sent or paid/)
+      assert.ok(!sent('/v1/audio/speech'), 'TTS not paid')
+
+      const img = await call(client, 'carpe_image_generate', { prompt: 'a fox', model: 'z-image-turbo', route: 'carpe' })
+      assert.equal(img.isError, true)
+      assert.match(img.text, /MEDIA_STORE_FULL/)
+      assert.ok(!sent('/v1/image/generate'), 'image not paid')
+
+      const ms = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+      assert.equal(ms.isError, true)
+      assert.match(ms.text, /MEDIA_STORE_FULL[\s\S]*nothing is lost/)
+      assert.ok(ms.text.includes(m.structured.job_id))
+      assert.ok(!sent('/v1/audio/music/retrieve'), 'the one-shot track was not fetched')
+
+      const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs.isError, true, 'never isError:false without the video')
+      assert.match(vs.text, /MEDIA_STORE_FULL/)
+      assert.ok(vs.text.includes(v.structured.job_id))
+
+      const gi = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
+      assert.equal(gi.isError, true)
+      const jobId = /job_id "([^"]+)"/.exec(String(gi.structured.error?.hint))?.[1]
+      assert.ok(jobId, gi.text)
+      await new Promise((res) => setTimeout(res, 50))
+      assert.ok(!sent('/v1/image/generate/complete'), 'the operator keeps the undelivered image')
+
+      // Room again: every job is delivered, nothing was lost.
+      r.remote.store.clear()
+      const ms2 = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+      assert.equal(ms2.isError, false, ms2.text)
+      assert.equal(ms2.structured.audio.storage, 'hosted_mcp')
+      const vs2 = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.equal(vs2.isError, false, vs2.text)
+      const gi2 = await call(client, 'carpe_image_status', { job_id: jobId, wait_seconds: 0 })
+      assert.equal(gi2.isError, false, gi2.text)
+      assert.ok(await waitFor(() => sent('/v1/image/generate/complete')))
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('polling a finished job again returns the same link: the store does not grow, the operator is not asked again', async () => {
+    const r = await startRemote()
+    try {
+      const { client } = await connect(r, await tokenFor(r, { sub: 're-poller' }))
+      const v = await call(client, 'carpe_video_generate', { model: 'kling-2.5-turbo-pro-text-to-video', prompt: 'a boat', duration: '5s', route: 'router' })
+      mock.counters['mus-long'] = 0
+      const m = await call(client, 'carpe_music_generate', { prompt: 'jazz', model: 'long-music', route: 'carpe' })
+      const img = await call(client, 'carpe_image_generate', { prompt: 'x', model: 'giant-image', route: 'carpe', mode: 'queue', wait_seconds: 5 })
+      const first = {
+        video: (await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })).structured.video,
+        music: (await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })).structured.audio,
+      }
+      const size = r.remote.store.size
+      const free = r.remote.store.free
+      const from = mock.calls.length
+      for (let i = 0; i < 5; i++) {
+        const vs = await call(client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+        assert.equal(vs.isError, false, vs.text)
+        assert.equal(vs.structured.video.url, first.video.url)
+        assert.equal(vs.structured.video.expires_at, first.video.expires_at)
+        assert.equal(vs.structured.video.already_stored, true)
+        const ms = await call(client, 'carpe_music_status', { job_id: m.structured.job_id, wait_seconds: 0 })
+        assert.equal(ms.isError, false, 'the one-shot track is still delivered, not JOB_NOT_FOUND')
+        assert.equal(ms.structured.audio.url, first.music.url)
+        const is = await call(client, 'carpe_image_status', { job_id: img.structured.job_id, wait_seconds: 0 })
+        assert.equal(is.isError, false, is.text)
+        assert.equal(is.structured.images[0].url, img.structured.images[0].url)
+      }
+      assert.equal(r.remote.store.size, size)
+      assert.equal(r.remote.store.free, free)
+      assert.ok(!mock.calls.slice(from).some((c) => /retrieve$/.test(c.path)), 'nothing fetched again')
+      // Another user polling the same job id is not handed this user's link.
+      const other = await connect(r, await tokenFor(r, { sub: 're-poller-2' }))
+      const theirs = await call(other.client, 'carpe_video_status', { job_id: v.structured.job_id, wait_seconds: 0 })
+      assert.notEqual(theirs.structured.video?.url, first.video.url)
+      await other.client.close()
+      await client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('each user has a share of the store: one user at their share does not block another', async () => {
+    const r = await startRemote({ CARPE_MCP_MEDIA_STORE_MB: '256', CARPE_MCP_MEDIA_STORE_PER_USER_MB: '64' })
+    try {
+      const hash = subHasher('test-salt')
+      const a = await connect(r, await tokenFor(r, { sub: 'share-a' }))
+      const b = await connect(r, await tokenFor(r, { sub: 'share-b' }))
+      r.remote.store.put({ bytes: Buffer.alloc(40 * MiB), mime: 'video/mp4' }, 'filler', { owner: hash('share-a') })
+      const from = mock.calls.length
+      const refused = await call(a.client, 'carpe_tts', { input: 'x', voice: 'long', route: 'carpe' })
+      assert.equal(refused.isError, true)
+      assert.match(refused.text, /MEDIA_STORE_FULL[\s\S]*Your share[\s\S]*Nothing was sent or paid/)
+      assert.ok(!mock.calls.slice(from).some((c) => c.path === '/v1/audio/speech'), 'not paid')
+      const fine = await call(b.client, 'carpe_tts', { input: 'x', voice: 'long', route: 'carpe' })
+      assert.equal(fine.isError, false, fine.text)
+      assert.equal(fine.structured.audio.storage, 'hosted_mcp')
+      for (const c of [a, b]) await c.client.close()
+    } finally {
+      await r.close()
+    }
+  })
+
+  test('store: per-owner share (reservations included) and one copy per job', () => {
+    const s = new MediaStore(100, 'https://mcp.example', 1000, () => 0, 50)
+    const hold = s.reserve(30, 'alice')
+    assert.equal(s.freeFor('alice'), 20)
+    assert.equal(s.freeFor('bob'), 50)
+    assert.throws(() => s.reserve(21, 'alice'), (e: any) => e.code === 'MEDIA_STORE_FULL' && /Your share/.test(e.message))
+    const one = hold.store({ bytes: Buffer.alloc(10), mime: 'audio/mpeg' }, 'm', 'job-1')
+    hold.release()
+    assert.equal(s.freeFor('alice'), 40)
+    const again = s.put({ bytes: Buffer.alloc(10), mime: 'audio/mpeg' }, 'm', { owner: 'alice', key: 'job-1' })
+    assert.equal(again.id, one.id)
+    assert.equal(again.existing, true)
+    assert.equal(s.freeFor('alice'), 40, 'no second copy')
+    const bobs = s.put({ bytes: Buffer.alloc(10), mime: 'audio/mpeg' }, 'm', { owner: 'bob', key: 'job-1' })
+    assert.notEqual(bobs.id, one.id, 'keys are per owner')
+    assert.equal(s.find({ owner: 'carol', key: 'job-1' }), undefined)
+  })
+
+  test('store: TTL, budget and reservations', () => {
+    let now = 1_000_000
+    const s = new MediaStore(100, 'https://mcp.example', 1000, () => now)
+    const a = s.put({ bytes: Buffer.alloc(40), mime: 'image/png' }, 'a')
+    assert.match(a.url, /^https:\/\/mcp\.example\/media\/[A-Za-z0-9_-]{22}$/)
+    assert.equal(s.free, 60)
+    const hold = s.reserve(50)
+    assert.equal(s.free, 10)
+    assert.throws(() => s.reserve(11), (e: any) => e.code === 'MEDIA_STORE_FULL')
+    assert.throws(() => s.put({ bytes: Buffer.alloc(11), mime: 'image/png' }, 'b'), (e: any) => e.code === 'MEDIA_STORE_FULL')
+    hold.store({ bytes: Buffer.alloc(30), mime: 'audio/mpeg' }, 'c')
+    hold.release()
+    assert.equal(s.free, 30, 'the unused part of the hold is freed')
+    const html = s.put({ bytes: Buffer.from('<script>'), mime: 'text/html' }, 'x')
+    assert.equal(s.get(html.id)!.mime, 'application/octet-stream', 'only image/audio/video types are served as such')
+    now += 1000
+    assert.equal(s.get(a.id), undefined, 'expired')
+    assert.equal(s.free, 100)
+    assert.equal(s.get('../../etc'), undefined)
+  })
+
+  test('the store budget must hold the largest single output', () => {
+    assert.throws(() => loadRemoteConfig({ CARPE_MCP_MEDIA_STORE_MB: '32' }), ConfigError)
+    assert.equal(loadRemoteConfig({}).mediaStoreBytes, 256 * MiB)
+    assert.throws(
+      () => createRemoteApp({ cfg: loadConfig({ CARPE_MCP_REMOTE: '1', CARPE_MAX_VIDEO_BYTES: String(100 * MiB) }), remote: loadRemoteConfig({ CARPE_MCP_MEDIA_STORE_MB: '64' }), log: () => undefined }),
+      /CARPE_MCP_MEDIA_STORE_MB must be at least 100/,
+    )
   })
 })
 

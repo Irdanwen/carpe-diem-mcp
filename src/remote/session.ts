@@ -7,7 +7,7 @@
  */
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
-import { CarpeClient } from '../carpe-client.js'
+import { CarpeClient, type PublicReadCache } from '../carpe-client.js'
 import type { Config } from '../config.js'
 import { LocalRefusal } from '../errors.js'
 import { createMcpServer } from '../server.js'
@@ -15,6 +15,7 @@ import type { Estimator, SpendGuard } from '../spend-guard.js'
 import { fail, type ToolContext, type ToolDef, type ToolExtra } from '../tools/context.js'
 import { buildTools } from '../tools/index.js'
 import { safeCode, type RemoteLogger } from './log.js'
+import type { MediaStore } from './media-store.js'
 import { REMOTE_REMOVED_TOOLS, requiredScope } from './policy.js'
 
 export interface RemoteSessionOptions {
@@ -31,6 +32,10 @@ export interface RemoteSessionOptions {
   user: string
   log: RemoteLogger
   fetchImpl?: typeof fetch
+  /** Shared temporary media store (GET /media/<id>). */
+  store?: MediaStore
+  /** Shared cache of the public catalogue reads. */
+  publicReads?: PublicReadCache
 }
 
 export interface RemoteMcp {
@@ -43,7 +48,7 @@ export interface RemoteMcp {
 
 export function buildRemoteServer(opts: RemoteSessionOptions): RemoteMcp {
   const { cfg } = opts
-  const client = new CarpeClient(cfg, undefined, opts.fetchImpl, opts.token, opts.onTokenRejected)
+  const client = new CarpeClient(cfg, undefined, opts.fetchImpl, opts.token, opts.onTokenRejected, opts.publicReads)
   const ctx: ToolContext = {
     client,
     cfg,
@@ -51,7 +56,7 @@ export function buildRemoteServer(opts: RemoteSessionOptions): RemoteMcp {
     get guard() {
       return opts.guard()
     },
-    media: { allowLocalFiles: false, outputDir: undefined, maxInputBytes: cfg.maxMediaBytes, remote: true },
+    media: { allowLocalFiles: false, outputDir: undefined, maxInputBytes: cfg.maxMediaBytes, remote: true, store: opts.store, owner: opts.user },
   }
   const tools = buildTools(ctx).filter((t) => !REMOTE_REMOVED_TOOLS.has(t.name))
 

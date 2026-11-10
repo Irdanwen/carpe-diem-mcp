@@ -24,6 +24,10 @@ export interface MintOptions {
   /** Sign with a key that is not in the JWKS. */
   rogueKey?: boolean
   alg?: 'ES256'
+  /** Header `typ` (default at+jwt; null = absent). */
+  typ?: string | null
+  /** Seconds from now. */
+  issuedAt?: number
 }
 
 export interface TestIssuer {
@@ -62,11 +66,11 @@ export async function startIssuer(resource: string, opts: { sub?: string; scope?
     const now = Math.floor(Date.now() / 1000)
     const key: CryptoKey = o.rogueKey ? rogue.privateKey : privateKey
     let jwt = new SignJWT({ scope: o.scope ?? 'carpe:inference carpe:account.read', client_id: 'test-client' })
-      .setProtectedHeader({ alg: o.alg ?? 'ES256', kid, typ: 'at+jwt' })
+      .setProtectedHeader({ alg: o.alg ?? 'ES256', kid, ...(o.typ === null ? {} : { typ: o.typ ?? 'at+jwt' }) })
       .setIssuer(o.iss ?? url)
       .setSubject(o.sub ?? 'user-a')
       .setAudience(o.aud ?? resource)
-      .setIssuedAt(now)
+      .setIssuedAt(now + (o.issuedAt ?? 0))
       .setJti(randomUUID())
       .setExpirationTime(now + (o.expiresIn ?? 3600))
     if (o.notBefore !== undefined) jwt = jwt.setNotBefore(now + o.notBefore)

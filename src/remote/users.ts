@@ -20,15 +20,15 @@ export class TokenBucket {
     this.last = now
   }
 
-  /** 0 when the request may go, else the seconds to wait. */
-  take(now = Date.now()): number {
+  /** 0 when `cost` requests may go (all of them are counted), else the seconds to wait. */
+  take(now = Date.now(), cost = 1): number {
     this.tokens = Math.min(this.capacity, this.tokens + ((now - this.last) / 1000) * this.perSecond)
     this.last = now
-    if (this.tokens >= 1) {
-      this.tokens -= 1
+    if (this.tokens >= cost) {
+      this.tokens -= cost
       return 0
     }
-    return Math.max(1, Math.ceil((1 - this.tokens) / this.perSecond))
+    return Math.max(1, Math.ceil((cost - this.tokens) / this.perSecond))
   }
 }
 
@@ -76,9 +76,9 @@ export class UserRegistry {
     return u.guard
   }
 
-  /** Rate limit: 0 = allowed, else Retry-After seconds. */
-  take(sub: string, now = Date.now()): number {
-    return this.state(sub, now).bucket.take(now)
+  /** Rate limit: 0 = allowed, else Retry-After seconds. `cost`: JSON-RPC messages (a batch counts each one). */
+  take(sub: string, now = Date.now(), cost = 1): number {
+    return this.state(sub, now).bucket.take(now, cost)
   }
 
   /** Forget users idle for a day (their guard and bucket start fresh). */
