@@ -107,7 +107,7 @@ export function loadRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteCo
     // At least the largest single output (a 64 MiB video), so any one of them can be kept.
     mediaStoreBytes: int(env, 'CARPE_MCP_MEDIA_STORE_MB', 256, 64) * 1024 * 1024,
     // The largest output (64 MiB) plus a synchronous call's reservation on top of it.
-    mediaStorePerUserBytes: int(env, 'CARPE_MCP_MEDIA_STORE_PER_USER_MB', 96, 64) * 1024 * 1024,
+    mediaStorePerUserBytes: int(env, 'CARPE_MCP_MEDIA_STORE_PER_USER_MB', 128, 64) * 1024 * 1024,
     maxInflightPerUser: int(env, 'CARPE_MCP_MAX_INFLIGHT_PER_USER', 4, 1),
     // At least one request of the largest size. A body being processed holds ~6.7 times its size in memory
     // (measured: ~165 MiB RSS for a 25 MiB transcription, ~210 MiB for a 39 MiB video input): 64 MB is

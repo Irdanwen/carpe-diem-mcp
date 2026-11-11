@@ -59,6 +59,10 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Only a tag on main gets a release (and a "Commit:" line the install trusts): a tag on any
+          # other commit is refused here. compare main...SHA = "behind"/"identical" ⇔ SHA is in main.
+          STATUS=$(gh api "repos/$REPO/compare/main...$SHA" --jq .status)
+          case "$STATUS" in behind|identical) ;; *) echo "$TAG ($SHA) is not on main ($STATUS): no release."; exit 1 ;; esac
           if gh release view "$TAG" --repo "$REPO" --json body --jq .body > existing.txt 2>/dev/null; then
             # A re-run: the release must already name this commit; it is never rewritten.
             grep -qx "Commit: $SHA" existing.txt || { echo "Release $TAG exists and does not name $SHA"; exit 1; }

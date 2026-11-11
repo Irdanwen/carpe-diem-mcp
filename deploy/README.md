@@ -55,27 +55,32 @@ docker compose up -d
 for i in $(seq 30); do curl -fsS http://127.0.0.1:3333/health && break; sleep 1; done
 curl -fsS http://127.0.0.1:3333/health                                 # {"ok":true}
 
-# 4. Certificate, then Nginx. The vhost is complete (its own port-80 block, the https lines): certbot only
-#    obtains and renews the certificate and never edits it. Its nginx plugin answers the challenge with a
-#    temporary server block of its own; the deploy hook reloads Nginx after each renewal.
-#    A configuration nginx refuses is removed again, so nginx keeps reloading.
+# 4. Nginx, then the certificate. The vhost is complete (its own port-80 block serving the ACME
+#    challenge from /var/www/acme, the https lines): certbot only obtains and renews the certificate, by
+#    webroot (no nginx plugin needed), and never edits it. Until the first certificate, a temporary
+#    self-signed pair lets nginx load the https block. A configuration nginx refuses is removed again,
+#    so nginx keeps reloading.
+SSL=/etc/nginx/ssl/mcp.carpe-diem.xyz
+mkdir -p /var/www/acme "$SSL"
+[ -e "$SSL/fullchain.pem" ] || openssl req -x509 -nodes -newkey rsa:2048 -days 2 -subj /CN=mcp.carpe-diem.xyz \
+  -keyout "$SSL/privkey.pem" -out "$SSL/fullchain.pem" 2>/dev/null
 cp nginx-http.conf /etc/nginx/conf.d/carpe-mcp.conf
-if ! nginx -t; then rm -f /etc/nginx/conf.d/carpe-mcp.conf; echo "nginx -t failed on nginx-http.conf"; exit 1; fi
-systemctl reload nginx
-[ -e /etc/letsencrypt/live/mcp.carpe-diem.xyz/fullchain.pem ] ||
-  certbot certonly --nginx -d mcp.carpe-diem.xyz --deploy-hook 'systemctl reload nginx'
 cp nginx-mcp.carpe-diem.xyz.conf /etc/nginx/sites-available/mcp.carpe-diem.xyz
 ln -sf /etc/nginx/sites-available/mcp.carpe-diem.xyz /etc/nginx/sites-enabled/mcp.carpe-diem.xyz
 if ! nginx -t; then
-  rm -f /etc/nginx/sites-enabled/mcp.carpe-diem.xyz
+  rm -f /etc/nginx/sites-enabled/mcp.carpe-diem.xyz /etc/nginx/conf.d/carpe-mcp.conf
   echo "nginx -t failed: the site was not enabled."; exit 1
 fi
 systemctl reload nginx
+[ -e /etc/letsencrypt/live/mcp.carpe-diem.xyz/fullchain.pem ] ||
+  certbot certonly --webroot -w /var/www/acme -d mcp.carpe-diem.xyz --deploy-hook 'systemctl reload nginx'
+ln -sf /etc/letsencrypt/live/mcp.carpe-diem.xyz/fullchain.pem /etc/letsencrypt/live/mcp.carpe-diem.xyz/privkey.pem "$SSL/"
+nginx -t && systemctl reload nginx
 )
 docker inspect --format '{{.State.Health.Status}}' carpe-mcp           # healthy (after ~30 s)
 ```
 
-Do not run `certbot --nginx` (install mode) on this site: it would add its own port-80 block, which logs the whole request line (`/media/<id>` included), next to ours.
+Do not run `certbot --nginx` (install mode) on this site: it would add its own port-80 block, which logs the whole request line (`/media/<id>` included), next to ours. The webroot `/var/www/acme` can be shared with the other sites of the host (it only holds challenge files for a few seconds).
 
 ## Checks after install
 
@@ -169,6 +174,9 @@ if ! nginx -t; then
   echo "nginx -t refused the new configuration: previous one restored, container not updated."; exit 1
 fi
 systemctl reload nginx
+# From here Nginx serves the new configuration: any failure below (docker compose included) must lead to
+# the rollback, so say it instead of stopping silently.
+trap 'echo "Update to v$MCP_VERSION failed after Nginx was reloaded: roll back to $OLD (next block)."' ERR
 
 # 4. Compose file and version (renames), then the container.
 mv -f "$NEW/compose.yml" compose.yml
