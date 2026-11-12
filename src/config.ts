@@ -118,9 +118,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     x402RpcUrl: env.CARPE_X402_RPC_URL?.trim() || 'https://mainnet.base.org',
     x402Escrow: env.CARPE_X402_ESCROW?.trim() || undefined,
     x402Asset: env.CARPE_X402_ASSET?.trim() || undefined,
-    // Remote: the authoritative cap is the connector key's daily cap on the operator; this one is per user and per UTC day.
+    // Remote: the only limit is the connector key's daily cap on the operator, chosen at consent.
+    // These two are off by default there (maxSpendUsd would be per user and per UTC day).
     maxSpendUsd: num(env.CARPE_MAX_SPEND_USD, remote ? 0 : 5, { allowZero: true }),
-    maxPerCallUsd: num(env.CARPE_MAX_PER_CALL_USD, 0.5, { allowZero: true }),
+    maxPerCallUsd: num(env.CARPE_MAX_PER_CALL_USD, remote ? 0 : 0.5, { allowZero: true }),
     readOnly: env.CARPE_READ_ONLY === '1' || env.CARPE_READ_ONLY === 'true',
     defaultRoute: route,
     defaultChatModel: env.CARPE_DEFAULT_CHAT_MODEL?.trim() || 'deepseek-v4-flash',
