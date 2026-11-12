@@ -2,7 +2,7 @@
 
 > Model Context Protocol server for **[Carpe Diem](https://carpe-diem.xyz)**: Venice AI models (text, image, video, speech, music, embeddings, web search), bought on the Carpe Diem marketplace — usually well below Venice list prices — with best-price routing, hard spend limits and optional **x402** pay-per-call from a wallet on Base.
 
-Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP host. Node.js ≥ 20.
+Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP host (Node.js ≥ 20) — and, hosted by Carpe Diem with nothing to install, with **claude.ai and ChatGPT**: `https://mcp.carpe-diem.xyz/mcp`.
 
 - **33 tools**, 3 resources (`carpe://models`, `carpe://pricing`, `carpe://markets`), 3 prompts.
 - Every result reports **the exact cost billed** and **who served it** (and whether it was a TEE).
@@ -10,6 +10,13 @@ Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP hos
 - Every tool declares `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`.
 
 ## Quick start
+
+**claude.ai or ChatGPT: nothing to install.** Add `https://mcp.carpe-diem.xyz/mcp` as a custom connector, sign in with your Carpe Diem account (a code sent by email) and choose a daily spending limit. No API key: the connector gets its own, billed to your credits and revocable in **API → Keys**.
+
+- **Claude** (web, desktop, mobile): **Customize → Connectors → + Add → Add custom connector**, paste the URL, **Add**, then **Connect**. On Team and Enterprise, an Owner adds it under **Organization settings → Connectors**. In a chat: **+ → Connectors**.
+- **ChatGPT** (web, developer mode on Plus, Pro, Business, Enterprise, Edu): **Settings → Apps → Advanced settings → Developer mode**, then **Create app** with the URL and **OAuth**.
+
+Step by step, and what differs from the local server (29 tools, no disk, credits only): **[carpe-diem.xyz/docs/integrations#web-assistants](https://carpe-diem.xyz/docs/integrations#web-assistants)**. The hosted connector accepts sign-ins from claude.ai and ChatGPT only; every other client runs the server locally:
 
 1. Create an API key on [carpe-diem.xyz](https://carpe-diem.xyz/build?tab=keys) → **API → Keys** (`cdm_…`) and add credits in **API → Balance**.
 2. Add the server to your MCP host.
@@ -62,7 +69,7 @@ env_vars = ["CARPE_API_KEY"]
 
 **Gemini CLI** (`~/.gemini/settings.json`) — declare the key in `env`: Gemini CLI hides inherited variables named `*KEY*`.
 
-Zed, Cline, Goose, Continue, LM Studio and others, with use cases and costs: **[carpe-diem.xyz/docs/integrations](https://carpe-diem.xyz/docs/integrations#mcp-install)**. ChatGPT and claude.ai on the web only accept remote MCP servers with OAuth: that is the hosted [remote mode](#remote-mode-hosted), in preview until the Carpe Diem side ships.
+Zed, Cline, Goose, Continue, LM Studio and others, with use cases and costs: **[carpe-diem.xyz/docs/integrations](https://carpe-diem.xyz/docs/integrations#mcp-install)**. ChatGPT and claude.ai only accept remote MCP servers with OAuth: use the hosted connector above.
 
 3. Restart the host and ask: *"Find the cheapest model to summarise this text, then do it."*
 
@@ -165,7 +172,7 @@ Carpe Diem refuses requests from sanctioned regions (HTTP 451). Buying inference
 
 ## Remote mode (hosted)
 
-> **Preview.** This is the server side of the hosted connector for ChatGPT and claude.ai (`https://mcp.carpe-diem.xyz/mcp`). It works against any OAuth issuer that behaves as described below, but the Carpe Diem side (OAuth for MCP clients on `compte.carpe-diem.xyz`, and the operator accepting these tokens) is not live yet. Until it is, use the local server above.
+> **Live** at `https://mcp.carpe-diem.xyz/mcp` since 2026-11-11, for claude.ai and ChatGPT (the authorization server, `compte.carpe-diem.xyz`, accepts sign-ins from those two clients only). This section describes the server side, to review it or run your own against an OAuth issuer that behaves as described below; to *use* it, see [Quick start](#quick-start).
 
 ```bash
 CARPE_MCP_HOST=127.0.0.1 npx carpe-diem-mcp --remote --port 3333   # behind a TLS reverse proxy
@@ -173,7 +180,7 @@ CARPE_MCP_HOST=127.0.0.1 npx carpe-diem-mcp --remote --port 3333   # behind a TL
 
 `--remote` (or `CARPE_MCP_REMOTE=1`) turns the server into an OAuth 2.1 **protected resource**, one process for many users:
 
-- **No credential on the server.** It refuses to start if `CARPE_API_KEY`, `CARPE_X402_PRIVATE_KEY`, `CARPE_X402_BUDGET_USD`, `CARPE_MCP_AUTH_TOKEN` or `CARPE_OUTPUT_DIR` is set. Each user signs in on the authorization server; their access token is relayed verbatim (`Authorization: Bearer`) to the operator on account and paid routes, and the operator resolves it to the connector's own `cdm_` key (usage per connector in **API → Usage**, revocation in **API → Keys**, daily cap chosen at consent). Public reads (models, prices, quotes) are sent without it: the operator does not accept connector tokens on those routes, so they all count on its anonymous rate limit for the server's IP (catalogue reads are cached for that reason; price quotes are not).
+- **No credential on the server.** It refuses to start if `CARPE_API_KEY`, `CARPE_X402_PRIVATE_KEY`, `CARPE_X402_BUDGET_USD`, `CARPE_MCP_AUTH_TOKEN` or `CARPE_OUTPUT_DIR` is set. Each user signs in on the authorization server; their access token is relayed verbatim (`Authorization: Bearer`) to the operator on account and paid routes, and the operator resolves it to the connector's own `cdm_` key (usage per connector in **API → Usage**, revocation in **API → Keys**, daily cap chosen at consent). Public reads (models, prices, quotes) are sent without it, so they all count on the operator's anonymous rate limit for the server's IP (catalogue reads are cached for that reason; price quotes are not). The operator now accepts connector tokens on those routes too, counted per account: sending them is the next step here.
 - **Discovery.** `GET /.well-known/oauth-protected-resource` (also under `/mcp`, RFC 9728) names the issuer and the scopes. A request without a valid token gets `401` with `WWW-Authenticate: Bearer resource_metadata="…"`, which starts the OAuth flow in the client.
 - **Token checks, on every request.** JWT signature against the issuer's JWKS (ES256 by default, cached, refetched on an unknown `kid`), `iss` = the issuer, `aud` contains this server's URL (RFC 8707; a token minted for anything else is refused), header `typ: at+jwt` (RFC 9068: an id_token is refused), `exp` enforced to the second (as the operator does), `nbf` / `iat` with 30 s of skew, a `sub`.
 - **Scopes.** `carpe:inference` for paid tools (and their job-status tools), `carpe:account.read` for balance, usage and the top-up link. Tools a token does not cover are hidden; calling one answers `403` with `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"` so the client can ask for more.
@@ -230,7 +237,8 @@ Serveur MCP pour Carpe Diem. Il donne à un agent l'accès aux modèles Venice (
 - **Deux surfaces.** `route: "carpe"` passe par `/v1` : Carpe seul, toujours dans son TEE. `route: "router"` passe par `/router` : le marché le moins cher, éventuellement hors TEE. Chaque résultat indique le marché qui a servi la requête et si c'était un TEE.
 - **Deux modes de paiement.** Avec une clé API `cdm_`, la dépense est facturée au compte. En x402, un permit USDC est signé pour ce qui reste du budget, allowance encore ouverte comprise : l'escrow ne peut pas prélever plus que le budget au total. Utilisez un wallet dédié à ce serveur : un permit signé ailleurs avec le même wallet peut passer inaperçu.
 - **Garde de dépense.** Le coût est estimé gratuitement avant chaque appel. L'appel est refusé localement au-delà de `CARPE_MAX_PER_CALL_USD` ou du budget de session `CARPE_MAX_SPEND_USD`.
-- **Mode distant (aperçu).** `--remote` sert plusieurs utilisateurs derrière OAuth, pour ChatGPT et claude.ai. Le serveur ne détient aucune clé : il relaie le jeton de chaque utilisateur à l'operator, n'écrit rien sur disque et ne journalise ni prompts ni jetons. Il attend le côté Carpe Diem (OAuth pour les clients MCP, acceptation du jeton par l'operator).
+- **Connecteur hébergé pour claude.ai et ChatGPT.** En ligne depuis le 11/11/2026 : `https://mcp.carpe-diem.xyz/mcp`. Rien à installer : on l'ajoute comme connecteur personnalisé (Claude : Customize → Connectors → Add custom connector ; ChatGPT : mode développeur → Create app, OAuth), on se connecte avec son compte Carpe Diem (code par email) et on choisit un plafond de dépense quotidien. Mode d'emploi : [carpe-diem.xyz/docs/fr/integrations](https://carpe-diem.xyz/docs/fr/integrations#web-assistants). Les autres clients (Claude Code, Codex, Cursor, VS Code…) utilisent le serveur local avec une clé.
+- **Mode distant.** C'est ce connecteur : `--remote` sert plusieurs utilisateurs derrière OAuth. Le serveur ne détient aucune clé : il relaie le jeton de chaque utilisateur à l'operator, n'écrit rien sur disque et ne journalise ni prompts ni jetons.
 
 ## License
 
