@@ -2,7 +2,7 @@
 
 > Model Context Protocol server for **[Carpe Diem](https://carpe-diem.xyz)**: Venice AI models (text, image, video, speech, music, embeddings, web search), bought on the Carpe Diem marketplace — usually well below Venice list prices — with best-price routing, hard spend limits and optional **x402** pay-per-call from a wallet on Base.
 
-Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP host (Node.js ≥ 20) — and, hosted by Carpe Diem with nothing to install, with **claude.ai and ChatGPT**: `https://mcp.carpe-diem.xyz/mcp`.
+Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP host (Node.js ≥ 20) — and, hosted by Carpe Diem with nothing to install, with **claude.ai, ChatGPT, Claude Code, Cursor, VS Code, Codex, Gemini CLI and Sub Rosa**: `https://mcp.carpe-diem.xyz/mcp`.
 
 - **33 tools**, 3 resources (`carpe://models`, `carpe://pricing`, `carpe://markets`), 3 prompts.
 - Every result reports **the exact cost billed** and **who served it** (and whether it was a TEE).
@@ -11,12 +11,18 @@ Works with Claude Code, Claude Desktop, Cursor, Cline, LM Studio and any MCP hos
 
 ## Quick start
 
-**claude.ai or ChatGPT: nothing to install.** Add `https://mcp.carpe-diem.xyz/mcp` as a custom connector, sign in with your Carpe Diem account (a code sent by email) and choose a daily spending limit. No API key: the connector gets its own, billed to your credits and revocable in **API → Keys**.
+**Hosted: nothing to install.** Add `https://mcp.carpe-diem.xyz/mcp` as a custom connector, sign in with your Carpe Diem account (a code sent by email) and choose a daily spending limit. No API key: the connector gets its own, billed to your credits and revocable in **API → Keys**.
 
 - **Claude** (web, desktop, mobile): **Customize → Connectors → + Add → Add custom connector**, paste the URL, **Add**, then **Connect**. On Team and Enterprise, an Owner adds it under **Organization settings → Connectors**. In a chat: **+ → Connectors**.
 - **ChatGPT** (web, developer mode on Plus, Pro, Business, Enterprise, Edu): **Settings → Apps → Advanced settings → Developer mode**, then **Create app** with the URL and **OAuth**.
+- **Claude Code**: `claude mcp add --transport http carpe-diem https://mcp.carpe-diem.xyz/mcp`, then `/mcp` → **carpe-diem** → **Authenticate**.
+- **Cursor**: `{ "mcpServers": { "carpe-diem": { "url": "https://mcp.carpe-diem.xyz/mcp" } } }` in `~/.cursor/mcp.json`, then **Connect** in **Settings → MCP**.
+- **VS Code**: **MCP: Add Server** → **HTTP**, paste the URL (or `"type": "http"` in `.vscode/mcp.json`).
+- **Codex**: `codex mcp add carpe-diem --url https://mcp.carpe-diem.xyz/mcp`, then `codex mcp login carpe-diem`.
+- **Gemini CLI**: `gemini mcp add --transport http carpe-diem https://mcp.carpe-diem.xyz/mcp`, then `/mcp auth carpe-diem`.
+- **Sub Rosa**: **Settings → Connectors → Add custom connector**.
 
-Step by step, and what differs from the local server (29 tools, no disk, credits only): **[carpe-diem.xyz/docs/integrations#web-assistants](https://carpe-diem.xyz/docs/integrations#web-assistants)**. The hosted connector accepts sign-ins from claude.ai and ChatGPT only; every other client runs the server locally:
+Step by step, and what differs from the local server (29 tools, no disk, credits only): **[carpe-diem.xyz/docs/integrations#web-assistants](https://carpe-diem.xyz/docs/integrations#web-assistants)**. Other OAuth-capable clients can try the same URL if they return to `http://127.0.0.1` or `http://localhost`. For local files, x402 or prepaid, or a client without OAuth sign-in, run the server locally:
 
 1. Create an API key on [carpe-diem.xyz](https://carpe-diem.xyz/build?tab=keys) → **API → Keys** (`cdm_…`) and add credits in **API → Balance**.
 2. Add the server to your MCP host.
@@ -69,7 +75,7 @@ env_vars = ["CARPE_API_KEY"]
 
 **Gemini CLI** (`~/.gemini/settings.json`) — declare the key in `env`: Gemini CLI hides inherited variables named `*KEY*`.
 
-Zed, Cline, Goose, Continue, LM Studio and others, with use cases and costs: **[carpe-diem.xyz/docs/integrations](https://carpe-diem.xyz/docs/integrations#mcp-install)**. ChatGPT and claude.ai only accept remote MCP servers with OAuth: use the hosted connector above.
+Zed, Cline, Goose, Continue, LM Studio and others, with use cases and costs: **[carpe-diem.xyz/docs/integrations](https://carpe-diem.xyz/docs/integrations#mcp-install)**. ChatGPT and claude.ai only accept remote MCP servers with OAuth: use the hosted connector above (Claude Code, Cursor, VS Code, Codex and Gemini CLI can use it too).
 
 3. Restart the host and ask: *"Find the cheapest model to summarise this text, then do it."*
 
@@ -172,7 +178,7 @@ Carpe Diem refuses requests from sanctioned regions (HTTP 451). Buying inference
 
 ## Remote mode (hosted)
 
-> **Live** at `https://mcp.carpe-diem.xyz/mcp` since 2026-11-11, for claude.ai and ChatGPT (the authorization server, `compte.carpe-diem.xyz`, accepts sign-ins from those two clients only). This section describes the server side, to review it or run your own against an OAuth issuer that behaves as described below; to *use* it, see [Quick start](#quick-start).
+> **Live** at `https://mcp.carpe-diem.xyz/mcp` since 2026-11-11, for claude.ai and ChatGPT, and for Claude Code, Cursor, VS Code, Codex, Gemini CLI and Sub Rosa (the authorization server, `compte.carpe-diem.xyz`, accepts client metadata documents from claude.ai, chatgpt.com and vscode.dev, and registrations, RFC 7591, that return only to the user's device). This section describes the server side, to review it or run your own against an OAuth issuer that behaves as described below; to *use* it, see [Quick start](#quick-start).
 
 ```bash
 CARPE_MCP_HOST=127.0.0.1 npx carpe-diem-mcp --remote --port 3333   # behind a TLS reverse proxy
@@ -237,7 +243,7 @@ Serveur MCP pour Carpe Diem. Il donne à un agent l'accès aux modèles Venice (
 - **Deux surfaces.** `route: "carpe"` passe par `/v1` : Carpe seul, toujours dans son TEE. `route: "router"` passe par `/router` : le marché le moins cher, éventuellement hors TEE. Chaque résultat indique le marché qui a servi la requête et si c'était un TEE.
 - **Deux modes de paiement.** Avec une clé API `cdm_`, la dépense est facturée au compte. En x402, un permit USDC est signé pour ce qui reste du budget, allowance encore ouverte comprise : l'escrow ne peut pas prélever plus que le budget au total. Utilisez un wallet dédié à ce serveur : un permit signé ailleurs avec le même wallet peut passer inaperçu.
 - **Garde de dépense.** Le coût est estimé gratuitement avant chaque appel. L'appel est refusé localement au-delà de `CARPE_MAX_PER_CALL_USD` ou du budget de session `CARPE_MAX_SPEND_USD`.
-- **Connecteur hébergé pour claude.ai et ChatGPT.** En ligne depuis le 11/11/2026 : `https://mcp.carpe-diem.xyz/mcp`. Rien à installer : on l'ajoute comme connecteur personnalisé (Claude : Customize → Connectors → Add custom connector ; ChatGPT : mode développeur → Create app, OAuth), on se connecte avec son compte Carpe Diem (code par email) et on choisit un plafond de dépense quotidien. Mode d'emploi : [carpe-diem.xyz/docs/fr/integrations](https://carpe-diem.xyz/docs/fr/integrations#web-assistants). Les autres clients (Claude Code, Codex, Cursor, VS Code…) utilisent le serveur local avec une clé.
+- **Connecteur hébergé pour claude.ai, ChatGPT et les outils de code.** En ligne depuis le 11/11/2026 : `https://mcp.carpe-diem.xyz/mcp`. Rien à installer : on l'ajoute comme connecteur personnalisé (Claude : Customize → Connectors → Add custom connector ; ChatGPT : mode développeur → Create app, OAuth), on se connecte avec son compte Carpe Diem (code par email) et on choisit un plafond de dépense quotidien. Mode d'emploi : [carpe-diem.xyz/docs/fr/integrations](https://carpe-diem.xyz/docs/fr/integrations#web-assistants). Claude Code, Cursor, VS Code, Codex, Gemini CLI et Sub Rosa peuvent s'en servir aussi, sans clé (commandes ci-dessus) ; le serveur local avec une clé reste là pour les fichiers locaux, x402 et le prépayé.
 - **Mode distant.** C'est ce connecteur : `--remote` sert plusieurs utilisateurs derrière OAuth. Le serveur ne détient aucune clé : il relaie le jeton de chaque utilisateur à l'operator, n'écrit rien sur disque et ne journalise ni prompts ni jetons.
 
 ## License
