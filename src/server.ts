@@ -37,7 +37,7 @@ export function instructions(cfg: Config): string {
       'Carpe Diem MCP (hosted): Venice AI models (text, image, video, audio, music, embeddings, web search) bought on the Carpe Diem marketplace, usually below Venice list prices.',
       'Two API surfaces, chosen per call with route: "carpe" = /v1, served only by Carpe inside its TEE (private); "router" = /router, the cheapest market, which may be outside a TEE (each result says route_used and tee).',
       'Use carpe_quote before expensive text calls, carpe_model_details for model constraints, carpe_balance for funds. Results report the exact cost billed.',
-      `Payment: the signed-in Carpe Diem account, through this connector's own key and within the daily cap chosen when connecting. Per-call guard: max $${cfg.maxPerCallUsd} (0 = no limit).`,
+      `Payment: the signed-in Carpe Diem account, through this connector's own key and within the daily cap chosen when connecting${cfg.maxPerCallUsd > 0 ? `. Per-call guard: max $${cfg.maxPerCallUsd}` : ', the only spending limit (no per-call limit)'}.`,
       'Media inputs: https:// URLs or data: URIs only. Large outputs come back as short-lived links.',
     ].join(' ')
   }

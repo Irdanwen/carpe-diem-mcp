@@ -180,7 +180,7 @@ export function asyncMediaTools(ctx: ToolContext): ToolDef[] {
       name: 'carpe_video_generate',
       title: 'Generate a video',
       description:
-        'Queue a video (Sora, Veo, Kling, Seedance, Wan, LTX, Grok Imagine…; text-to-video, image-to-video, reference-to-video). The payload is priced first (free quote) and refused locally above CARPE_MAX_PER_CALL_USD. ' +
+        'Queue a video (Sora, Veo, Kling, Seedance, Wan, LTX, Grok Imagine…; text-to-video, image-to-video, reference-to-video). The payload is priced first (free quote) and refused locally above the per-call limit, if one is set. ' +
         'Returns a job_id; carpe_video_status downloads the MP4 when ready (videos take minutes). Read the model constraints (durations, aspect ratios, resolutions) with carpe_model_details.',
       paid: true,
       inputSchema: {

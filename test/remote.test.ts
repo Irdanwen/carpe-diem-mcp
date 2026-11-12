@@ -126,7 +126,8 @@ describe('configuration', () => {
     const cfg = loadConfig(base)
     assert.equal(cfg.remote, true)
     assert.equal(cfg.maxSpendUsd, 0, 'the daily cap is the operator\'s; the local per-user total is off by default')
-    assert.equal(cfg.maxPerCallUsd, 0.5)
+    assert.equal(cfg.maxPerCallUsd, 0, 'no per-call limit either: the daily cap chosen at consent is the only one')
+    assert.equal(loadConfig({}).maxPerCallUsd, 0.5, 'the local server keeps its per-call guard')
     assert.equal(loadConfig({}).remote, false)
   })
 
@@ -341,6 +342,21 @@ describe('credentials and isolation', () => {
     const unknown = await rpc(srv, a, { jsonrpc: '2.0', id: 4, method: 'tools/list', params: {} }, 'no-such-session')
     assert.equal(unknown.status, 404)
     await client.close()
+  })
+
+  test('no per-call limit: an expensive call goes through (the daily cap is the operator\'s)', async () => {
+    const r = await startRemote()
+    try {
+      const a = await connect(r, await tokenFor(r, { sub: 'big-spender' }))
+      const heavy = await call(a.client, 'carpe_image_generate', { prompt: 'a cat', model: 'gpt-image-2', wait_seconds: 30, route: 'carpe' })
+      assert.equal(heavy.isError, false, heavy.text)
+      assert.doesNotMatch(heavy.text, /SPEND_LIMIT/)
+      const spend = await call(a.client, 'carpe_session_spend')
+      assert.equal(spend.structured.per_call_limit_usd, null)
+      await a.client.close()
+    } finally {
+      await r.close()
+    }
   })
 
   test('spend guards are per user: one user exhausting hers does not touch another\'s', async () => {
