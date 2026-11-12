@@ -806,7 +806,7 @@ describe('rate and memory', () => {
     assert.equal(d.bodyBudgetBytes, 64 * 1024 * 1024)
     assert.equal(d.bodyBudgetPerUserBytes, 48 * 1024 * 1024)
     assert.equal(d.bodyTimeoutMs, 30_000)
-    assert.equal(d.mediaStorePerUserBytes, 96 * 1024 * 1024)
+    assert.equal(d.mediaStorePerUserBytes, 128 * 1024 * 1024)
     assert.throws(() => loadRemoteConfig({ CARPE_MCP_BODY_BUDGET_MB: '39' }), ConfigError)
   })
 })

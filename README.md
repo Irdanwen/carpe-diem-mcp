@@ -205,7 +205,7 @@ CARPE_MCP_HOST=127.0.0.1 npx carpe-diem-mcp --remote --port 3333   # behind a TL
 | `CARPE_MCP_MAX_JSON_VALUES` | `100000` | JSON values of one request body (`{`, `[` and `,` outside strings), counted before parsing (`413` beyond). ~64 bytes of heap per parsed value: ~6 MiB at the limit; a real request has at most a few thousand. At least `100` |
 | `CARPE_MCP_LOG_SALT` | random per process | Key of the hashed user id in the logs (set it to correlate across restarts) |
 | `CARPE_MCP_MEDIA_STORE_MB` | `256` | Memory budget of the temporary media store (stored outputs plus room held for one-shot calls in flight); at least the largest single output (64) |
-| `CARPE_MCP_MEDIA_STORE_PER_USER_MB` | `96` | Each user's share of the media store, room held included (the largest output, 64, plus one synchronous call); at least `64` |
+| `CARPE_MCP_MEDIA_STORE_PER_USER_MB` | `128` | Each user's share of the media store, room held included (two of the largest outputs, 64 each, e.g. two videos polled at once); at least `64` |
 
 `CARPE_MCP_HOST`, `PORT` and `CARPE_MCP_ALLOWED_ORIGINS` apply as in HTTP mode. Run it behind a TLS reverse proxy; http URLs are accepted for the issuer and the resource only on loopback (tests).
 

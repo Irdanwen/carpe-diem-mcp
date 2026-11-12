@@ -461,7 +461,7 @@ export class X402Session {
       }
       // A balance too low is not cured by a new permit (the operator checks it first, before the allowance):
       // no re-sign, the error and its hint (fund the wallet) go back as they are.
-      const lowBalance = code === 'X402_PREFLIGHT_FAILED' && /USDC balance/i.test(String((body as { error?: unknown })?.error ?? ''))
+      const lowBalance = code === 'X402_PREFLIGHT_FAILED' && /USDC balance|insufficient[^.]{0,40}balance|balance[^.]{0,40}insufficient/i.test(String((body as { error?: unknown })?.error ?? ''))
       if ((code === 'X402_INVALID' || code === 'X402_PREFLIGHT_FAILED') && !lowBalance && this.header && !resigned) {
         // The cached permit is spent, expired, or its nonce was consumed (the operator's preflight then
         // simulates a permit that can no longer apply): fetch a fresh challenge, once.
